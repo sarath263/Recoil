@@ -18,6 +18,7 @@ import type {
   RecoilValue,
   RecoilValueReadOnly,
 } from '../core/Recoil_RecoilValue';
+import type {RetainedBy} from '../core/Recoil_RetainedBy';
 import type {
   GetRecoilValue,
   ResetRecoilState,
@@ -25,6 +26,7 @@ import type {
 } from './Recoil_selector';
 
 const cacheWithValueEquality = require('../caches/Recoil_cacheWithValueEquality');
+const {setConfigDeletionHandler} = require('../core/Recoil_Node');
 const stableStringify = require('../util/Recoil_stableStringify');
 const selector = require('./Recoil_selector');
 
@@ -47,6 +49,7 @@ type ReadOnlySelectorFamilyOptions<T, P: Parameter> = $ReadOnly<{
     RecoilValue<T>,
   >,
   dangerouslyAllowMutability?: boolean,
+  retainedBy_UNSTABLE?: RetainedBy | (P => RetainedBy),
 }>;
 
 export type ReadWriteSelectorFamilyOptions<T, P: Parameter> = $ReadOnly<{
@@ -100,13 +103,20 @@ function selectorFamily<T, Params: Parameter>(
       return cachedSelector;
     }
 
-    const myKey = `${options.key}__selectorFamily/${stableStringify(params, {
-      // It is possible to use functions in parameters if the user uses
-      // a cache with reference equality thanks to the incrementing index.
-      allowFunctions: true,
-    }) ?? 'void'}/${nextIndex++}`; // Append index in case values serialize to the same key string
+    const myKey = `${options.key}__selectorFamily/${
+      stableStringify(params, {
+        // It is possible to use functions in parameters if the user uses
+        // a cache with reference equality thanks to the incrementing index.
+        allowFunctions: true,
+      }) ?? 'void'
+    }/${nextIndex++}`; // Append index in case values serialize to the same key string
     const myGet = callbacks => options.get(params)(callbacks);
     const myCacheImplementation = options.cacheImplementation_UNSTABLE?.();
+
+    const retainedBy =
+      typeof options.retainedBy_UNSTABLE === 'function'
+        ? options.retainedBy_UNSTABLE(params)
+        : options.retainedBy_UNSTABLE;
 
     let newSelector;
     if (options.set != null) {
@@ -118,6 +128,7 @@ function selectorFamily<T, Params: Parameter>(
         set: mySet,
         cacheImplementation_UNSTABLE: myCacheImplementation,
         dangerouslyAllowMutability: options.dangerouslyAllowMutability,
+        retainedBy_UNSTABLE: retainedBy,
       });
     } else {
       newSelector = selector<T>({
@@ -125,9 +136,13 @@ function selectorFamily<T, Params: Parameter>(
         get: myGet,
         cacheImplementation_UNSTABLE: myCacheImplementation,
         dangerouslyAllowMutability: options.dangerouslyAllowMutability,
+        retainedBy_UNSTABLE: retainedBy,
       });
     }
     selectorCache = selectorCache.set(params, newSelector);
+    setConfigDeletionHandler(newSelector.key, () => {
+      selectorCache = selectorCache.delete(params);
+    });
     return newSelector;
   };
 }

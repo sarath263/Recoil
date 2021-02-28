@@ -4,9 +4,9 @@
  * This file is a manual translation of the flow types, which are the source of truth, so we should not introduce new terminology or behavior in this file.
  */
 
-export {};
+export { };
 
-import * as React from 'react';
+  import * as React from 'react';
 
 // state.d.ts
 type NodeKey = string;
@@ -23,12 +23,35 @@ export interface RecoilRootProps {
 
 export const RecoilRoot: React.FC<RecoilRootProps>;
 
+// Effect is called the first time a node is used with a <RecoilRoot>
+export type AtomEffect<T> = (param: {
+  node: RecoilState<T>,
+  trigger: 'set' | 'get',
+
+  // Call synchronously to initialize value or async to change it later
+  setSelf: (param:
+    | T
+    | DefaultValue
+    | Promise<T | DefaultValue>
+    | ((param: T | DefaultValue) => T | DefaultValue),
+  ) => void,
+  resetSelf: () => void,
+
+  // Subscribe callbacks to events.
+  // Atom effect observers are called before global transaction observers
+  onSet: (
+    param: (newValue: T | DefaultValue, oldValue: T | DefaultValue) => void,
+  ) => void,
+}) => void | (() => void);
+
 // atom.d.ts
 export interface AtomOptions<T> {
   key: NodeKey;
   default: RecoilValue<T> | Promise<T> | T;
+  effects_UNSTABLE?: ReadonlyArray<AtomEffect<T>>;
   dangerouslyAllowMutability?: boolean;
 }
+
 /**
  * Creates an atom, which represents a piece of writeable state
  */
@@ -70,10 +93,29 @@ export interface SnapshotID {
   readonly [SnapshotID_OPAQUE]: true;
 }
 
+interface ComponentInfo {
+  name: string;
+}
+
+interface AtomInfo<T> {
+  loadable?: Loadable<T>;
+  isActive: boolean;
+  isSet: boolean;
+  isModified: boolean; // TODO report modified selectors
+  type: 'atom' | 'selector' | undefined; // undefined until initialized for now
+  deps: Iterable<RecoilValue<T>>;
+  subscribers: {
+    nodes: Iterable<RecoilValue<T>>,
+    components: Iterable<ComponentInfo>,
+  };
+}
+
 export class Snapshot {
   getID(): SnapshotID;
   getLoadable<T>(recoilValue: RecoilValue<T>): Loadable<T>;
   getPromise<T>(recoilValue: RecoilValue<T>): Promise<T>;
+  getNodes_UNSTABLE(opts?: { isModified?: boolean }): Iterable<RecoilValue<unknown>>;
+  getInfo_UNSTABLE<T>(recoilValue: RecoilValue<T>): AtomInfo<T>;
   map(cb: (mutableSnapshot: MutableSnapshot) => void): Snapshot;
   asyncMap(cb: (mutableSnapshot: MutableSnapshot) => Promise<void>): Promise<Snapshot>;
 }
@@ -133,6 +175,11 @@ export function useSetRecoilState<T>(recoilState: RecoilState<T>): SetterOrUpdat
 export function useResetRecoilState(recoilState: RecoilState<any>): Resetter; // eslint-disable-line @typescript-eslint/no-explicit-any
 
 /**
+ * Returns current info about an atom
+ */
+export function useGetRecoilValueInfo_UNSTABLE<T>(recoilValue: RecoilValue<T>): AtomInfo<T>;
+
+/**
  * Returns a function that will run the callback that was passed when
  * calling this hook. Useful for accessing Recoil state in response to
  * events.
@@ -158,25 +205,43 @@ export const RecoilBridge: React.FC;
 export function useRecoilBridgeAcrossReactRoots_UNSTABLE(): typeof RecoilBridge;
 
 // loadable.d.ts
-type ResolvedLoadablePromiseInfo<T> = Readonly<{
-  value: T;
-}>;
+declare const LoadablePromiseValue_OPAQUE: unique symbol;
+interface LoadablePromiseValue {
+  readonly [LoadablePromiseValue_OPAQUE]: true;
+}
+type LoadablePromise<T> = Promise<LoadablePromiseValue>;
 
-export type LoadablePromise<T> = Promise<ResolvedLoadablePromiseInfo<T>>;
+interface BaseLoadable<T> {
+  getValue: () => T;
+  toPromise: () => Promise<T>;
+  valueMaybe: () => T | void;
+  valueOrThrow: () => T;
+  errorMaybe: () => Error | void;
+  errorOrThrow: () => Error;
+  promiseMaybe: () => Promise<T> | void;
+  promiseOrThrow: () => Promise<T>;
+  map: <S>(map: (from: T) => Promise<S> | S) => Loadable<S>;
+}
+
+interface ValueLoadable<T> extends BaseLoadable<T> {
+  state: 'hasValue';
+  contents: T;
+}
+
+interface LoadingLoadable<T> extends BaseLoadable<T> {
+  state: 'loading';
+  contents: LoadablePromise<T>;
+}
+
+interface ErrorLoadable<T> extends BaseLoadable<T> {
+  state: 'hasError';
+  contents: Error;
+}
 
 export type Loadable<T> =
-  | Readonly<{
-      state: 'hasValue';
-      contents: T;
-    }>
-  | Readonly<{
-      state: 'hasError';
-      contents: Error;
-    }>
-  | Readonly<{
-      state: 'loading';
-      contents: LoadablePromise<T>;
-    }>;
+  | ValueLoadable<T>
+  | LoadingLoadable<T>
+  | ErrorLoadable<T>;
 
 // recoilValue.d.ts
 declare class AbstractRecoilValue<T> {
@@ -211,6 +276,7 @@ export interface AtomFamilyOptions<T, P extends SerializableParam> {
   key: NodeKey;
   dangerouslyAllowMutability?: boolean;
   default: RecoilValue<T> | Promise<T> | T | ((param: P) => T | RecoilValue<T> | Promise<T>);
+  effects_UNSTABLE?: | ReadonlyArray<AtomEffect<T>> | ((param: P) => ReadonlyArray<AtomEffect<T>>);
 }
 
 export function atomFamily<T, P extends SerializableParam>(
@@ -279,11 +345,11 @@ export function waitForNone<RecoilValues extends { [key: string]: RecoilValue<an
 ): RecoilValueReadOnly<UnwrapRecoilValueLoadables<RecoilValues>>;
 
 export function waitForAny<RecoilValues extends Array<RecoilValue<any>> | [RecoilValue<any>]>(
-    param: RecoilValues,
+  param: RecoilValues,
 ): RecoilValueReadOnly<UnwrapRecoilValueLoadables<RecoilValues>>;
 
 export function waitForAny<RecoilValues extends { [key: string]: RecoilValue<any> }>(
-  param: RecoilValues,
+    param: RecoilValues,
 ): RecoilValueReadOnly<UnwrapRecoilValueLoadables<RecoilValues>>;
 
 export function waitForAll<RecoilValues extends Array<RecoilValue<any>> | [RecoilValue<any>]>(
@@ -294,4 +360,14 @@ export function waitForAll<RecoilValues extends { [key: string]: RecoilValue<any
   param: RecoilValues,
 ): RecoilValueReadOnly<UnwrapRecoilValues<RecoilValues>>;
 
+export function waitForAllSettled<RecoilValues extends Array<RecoilValue<any>> | [RecoilValue<any>]>(
+  param: RecoilValues,
+): RecoilValueReadOnly<UnwrapRecoilValueLoadables<RecoilValues>>;
+
+export function waitForAllSettled<RecoilValues extends { [key: string]: RecoilValue<any> }>(
+  param: RecoilValues,
+): RecoilValueReadOnly<UnwrapRecoilValueLoadables<RecoilValues>>;
+
 /* eslint-enable @typescript-eslint/no-explicit-any */
+
+export function snapshot_UNSTABLE(initializeState?: (shapshot: MutableSnapshot) => void): Snapshot;

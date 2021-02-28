@@ -10,23 +10,36 @@
  */
 'use strict';
 
-const gkx = require('../../util/Recoil_gkx');
-gkx.setFail('recoil_async_selector_refactor');
+const {getRecoilTestFn} = require('../../testing/Recoil_TestingUtils');
 
-const React = require('React');
-const {act} = require('ReactTestUtils');
-
-const {freshSnapshot} = require('../../core/Recoil_Snapshot');
-const atom = require('../../recoil_values/Recoil_atom');
-const atomFamily = require('../../recoil_values/Recoil_atomFamily');
-const selector = require('../../recoil_values/Recoil_selector');
-const {
+let React,
+  act,
+  freshSnapshot,
+  atom,
+  atomFamily,
+  selector,
   ReadsAtom,
   asyncSelector,
   componentThatReadsAndWritesAtom,
   renderElements,
-} = require('../../testing/Recoil_TestingUtils');
-const {useRecoilTransactionObserver} = require('../Recoil_Hooks');
+  useRecoilTransactionObserver;
+
+const testRecoil = getRecoilTestFn(() => {
+  React = require('React');
+  ({act} = require('ReactTestUtils'));
+
+  ({freshSnapshot} = require('../../core/Recoil_Snapshot'));
+  atom = require('../../recoil_values/Recoil_atom');
+  atomFamily = require('../../recoil_values/Recoil_atomFamily');
+  selector = require('../../recoil_values/Recoil_selector');
+  ({
+    ReadsAtom,
+    asyncSelector,
+    componentThatReadsAndWritesAtom,
+    renderElements,
+  } = require('../../testing/Recoil_TestingUtils'));
+  ({useRecoilTransactionObserver} = require('../Recoil_Hooks'));
+});
 
 function TransactionObserver({callback}) {
   useRecoilTransactionObserver(callback);
@@ -34,10 +47,11 @@ function TransactionObserver({callback}) {
 }
 
 // Run test first since it deals with all registered atoms
-test('getNodes', () => {
+testRecoil('getNodes', () => {
   let snapshot = freshSnapshot();
   function UseRecoilTransactionObserver() {
     useRecoilTransactionObserver(p => {
+      p.snapshot.retain();
       snapshot = p.snapshot;
     });
     return null;
@@ -116,7 +130,7 @@ test('getNodes', () => {
   // TODO Test dirty selectors
 });
 
-test('Can observe atom value', async () => {
+testRecoil('Can observe atom value', async () => {
   const atomA = atom({
     key: 'Observe Atom A',
     default: 'DEFAULT A',
@@ -135,6 +149,8 @@ test('Can observe atom value', async () => {
     <>
       <TransactionObserver
         callback={({snapshot, previousSnapshot}) => {
+          snapshot.retain();
+          previousSnapshot.retain();
           transactions.push({snapshot, previousSnapshot});
         }}
       />
@@ -192,7 +208,7 @@ test('Can observe atom value', async () => {
   ).resolves.toEqual('SET B');
 });
 
-test('Can observe selector value', async () => {
+testRecoil('Can observe selector value', async () => {
   const atomA = atom({
     key: 'Observe Atom for Selector',
     default: 'DEFAULT',
@@ -210,6 +226,8 @@ test('Can observe selector value', async () => {
     <>
       <TransactionObserver
         callback={({snapshot, previousSnapshot}) => {
+          snapshot.retain();
+          previousSnapshot.retain();
           transactions.push({snapshot, previousSnapshot});
         }}
       />
@@ -234,7 +252,7 @@ test('Can observe selector value', async () => {
   ).resolves.toEqual('SELECTOR DEFAULT');
 });
 
-test('Can observe async selector value', async () => {
+testRecoil('Can observe async selector value', async () => {
   const atomA = atom({
     key: 'Observe Atom for Async Selector',
     default: 'DEFAULT',
@@ -248,6 +266,8 @@ test('Can observe async selector value', async () => {
     <>
       <TransactionObserver
         callback={({snapshot, previousSnapshot}) => {
+          snapshot.retain();
+          previousSnapshot.retain();
           transactions.push({snapshot, previousSnapshot});
         }}
       />

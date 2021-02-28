@@ -9,7 +9,9 @@
  * @format
  */
 
-export default function shallowArrayEqual<TArr: $ReadOnlyArray<mixed>>(
+'use strict';
+
+function shallowArrayEqual<TArr: $ReadOnlyArray<mixed>>(
   a: TArr,
   b: TArr,
 ): boolean {
@@ -29,3 +31,5 @@ export default function shallowArrayEqual<TArr: $ReadOnlyArray<mixed>>(
 
   return true;
 }
+
+module.exports = shallowArrayEqual;

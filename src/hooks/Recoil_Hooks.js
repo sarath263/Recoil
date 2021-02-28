@@ -34,12 +34,16 @@ const {
   setUnvalidatedRecoilValue,
   subscribeToRecoilValue,
 } = require('../core/Recoil_RecoilValueInterface');
+const {updateRetainCount} = require('../core/Recoil_Retention');
+const {RetentionZone} = require('../core/Recoil_RetentionZone');
 const {Snapshot, cloneSnapshot} = require('../core/Recoil_Snapshot');
 const {setByAddingToSet} = require('../util/Recoil_CopyOnWrite');
 const differenceSets = require('../util/Recoil_differenceSets');
+const {isSSR} = require('../util/Recoil_Environment');
 const expectationViolation = require('../util/Recoil_expectationViolation');
 const filterMap = require('../util/Recoil_filterMap');
 const filterSet = require('../util/Recoil_filterSet');
+const gkx = require('../util/Recoil_gkx');
 const invariant = require('../util/Recoil_invariant');
 const mapMap = require('../util/Recoil_mapMap');
 const mergeMaps = require('../util/Recoil_mergeMaps');
@@ -49,8 +53,13 @@ const {
 } = require('../util/Recoil_mutableSource');
 const nullthrows = require('../util/Recoil_nullthrows');
 const recoverableViolation = require('../util/Recoil_recoverableViolation');
+const shallowArrayEqual = require('../util/Recoil_shallowArrayEqual');
 const Tracing = require('../util/Recoil_Tracing');
 const useComponentName = require('../util/Recoil_useComponentName');
+
+// Components that aren't mounted after suspending for this long will be assumed
+// to be discarded and their resources released.
+const SUSPENSE_TIMEOUT_MS = 120000;
 
 function handleLoadable<T>(loadable: Loadable<T>, atom, storeRef): T {
   // We can't just throw the promise we are waiting on to Suspense.  If the
@@ -86,11 +95,17 @@ export type RecoilInterface = {
   getRecoilValue: <T>(RecoilValue<T>) => T,
   getRecoilValueLoadable: <T>(RecoilValue<T>) => Loadable<T>,
   getRecoilState: <T>(RecoilState<T>) => [T, SetterOrUpdater<T>],
-  getRecoilStateLoadable<T>(RecoilState<T>): [Loadable<T>, SetterOrUpdater<T>],
+  getRecoilStateLoadable: <T>(
+    RecoilState<T>,
+  ) => [Loadable<T>, SetterOrUpdater<T>],
   getSetRecoilState: <T>(RecoilState<T>) => SetterOrUpdater<T>,
   getResetRecoilState: <T>(RecoilState<T>) => Resetter,
 };
 
+/**
+ * Various things are broken with useRecoilInterface, particularly concurrent mode
+ * and memory management. They will not be fixed.
+ * */
 function useRecoilInterface_DEPRECATED(): RecoilInterface {
   const storeRef = useStoreRef();
   const [_, forceUpdate] = useState([]);
@@ -104,11 +119,11 @@ function useRecoilInterface_DEPRECATED(): RecoilInterface {
     key => {
       const sub = subscriptions.current.get(key);
       if (sub) {
-        sub.release(storeRef.current);
+        sub.release();
         subscriptions.current.delete(key);
       }
     },
-    [storeRef, subscriptions],
+    [subscriptions],
   );
 
   const componentName = useComponentName();
@@ -195,6 +210,7 @@ function useRecoilInterface_DEPRECATED(): RecoilInterface {
       recoilState: RecoilState<T>,
     ): SetterOrUpdater<T> {
       if (__DEV__) {
+        // $FlowFixMe[escaped-generic]
         validateRecoilValue(recoilState, 'useSetRecoilState');
       }
       return (
@@ -206,6 +222,7 @@ function useRecoilInterface_DEPRECATED(): RecoilInterface {
 
     function useResetRecoilState<T>(recoilState: RecoilState<T>): Resetter {
       if (__DEV__) {
+        // $FlowFixMe[escaped-generic]
         validateRecoilValue(recoilState, 'useResetRecoilState');
       }
       return () => setRecoilValue(storeRef.current, recoilState, DEFAULT_VALUE);
@@ -215,6 +232,7 @@ function useRecoilInterface_DEPRECATED(): RecoilInterface {
       recoilValue: RecoilValue<T>,
     ): Loadable<T> {
       if (__DEV__) {
+        // $FlowFixMe[escaped-generic]
         validateRecoilValue(recoilValue, 'useRecoilValueLoadable');
       }
       if (!recoilValuesUsed.current.has(recoilValue.key)) {
@@ -229,9 +247,11 @@ function useRecoilInterface_DEPRECATED(): RecoilInterface {
 
     function useRecoilValue<T>(recoilValue: RecoilValue<T>): T {
       if (__DEV__) {
+        // $FlowFixMe[escaped-generic]
         validateRecoilValue(recoilValue, 'useRecoilValue');
       }
       const loadable = useRecoilValueLoadable(recoilValue);
+      // $FlowFixMe[escaped-generic]
       return handleLoadable(loadable, recoilValue, storeRef);
     }
 
@@ -239,6 +259,7 @@ function useRecoilInterface_DEPRECATED(): RecoilInterface {
       recoilState: RecoilState<T>,
     ): [T, SetterOrUpdater<T>] {
       if (__DEV__) {
+        // $FlowFixMe[escaped-generic]
         validateRecoilValue(recoilState, 'useRecoilState');
       }
       return [useRecoilValue(recoilState), useSetRecoilState(recoilState)];
@@ -248,6 +269,7 @@ function useRecoilInterface_DEPRECATED(): RecoilInterface {
       recoilState: RecoilState<T>,
     ): [Loadable<T>, SetterOrUpdater<T>] {
       if (__DEV__) {
+        // $FlowFixMe[escaped-generic]
         validateRecoilValue(recoilState, 'useRecoilStateLoadable');
       }
       return [
@@ -273,52 +295,69 @@ function useRecoilValueLoadable_MUTABLESOURCE<T>(
   recoilValue: RecoilValue<T>,
 ): Loadable<T> {
   if (__DEV__) {
+    // $FlowFixMe[escaped-generic]
     validateRecoilValue(recoilValue, 'useRecoilValueLoadable');
   }
   const storeRef = useStoreRef();
 
-  const getValue = useCallback(() => {
+  const getLoadable = useCallback(() => {
+    const store = storeRef.current;
+    const treeState = store.getState().currentTree;
+    return getRecoilValueAsLoadable(store, recoilValue, treeState);
+  }, [storeRef, recoilValue]);
+  const getLoadableWithTesting = useCallback(() => {
     if (__DEV__) {
       recoilComponentGetRecoilValueCount_FOR_TESTING.current++;
     }
-    return getRecoilValueAsLoadable(
-      storeRef.current,
-      recoilValue,
-      storeRef.current.getState().currentTree,
-    );
-  }, [storeRef, recoilValue]);
+    return getLoadable();
+  }, [getLoadable]);
 
   const componentName = useComponentName();
 
   const subscribe = useCallback(
-    (_something, callback) => {
+    (_storeState, callback) => {
       const store = storeRef.current;
-      const sub = subscribeToRecoilValue(
+      const subscription = subscribeToRecoilValue(
         store,
         recoilValue,
-        () => {
+        () =>
           Tracing.trace(
             'RecoilValue subscription fired',
             recoilValue.key,
             () => {
-              callback();
+              if (!gkx('recoil_suppress_rerender_in_callback')) {
+                return callback();
+              }
+              // Only re-render if the value has changed.
+              // This will evaluate the atom/selector now as well as when the
+              // component renders, but that may help with prefetching.
+              const newLoadable = getLoadable();
+              if (!prevLoadableRef.current.is(newLoadable)) {
+                callback();
+              }
             },
-          );
-        },
+          ),
         componentName,
       );
-      return () => sub.release(store);
+      return subscription.release;
     },
-    [recoilValue, storeRef, componentName],
+    [storeRef, recoilValue, componentName, getLoadable],
   );
 
-  return useMutableSource(useRecoilMutableSource(), getValue, subscribe);
+  const source = useRecoilMutableSource();
+  const loadable = useMutableSource(source, getLoadableWithTesting, subscribe);
+  const prevLoadableRef = useRef(loadable);
+  useEffect(() => {
+    prevLoadableRef.current = loadable;
+  });
+  return loadable;
 }
 
 function useRecoilValueLoadable_LEGACY<T>(
   recoilValue: RecoilValue<T>,
 ): Loadable<T> {
   if (__DEV__) {
+    // $FlowFixMe[escaped-generic]
     validateRecoilValue(recoilValue, 'useRecoilValueLoadable');
   }
   const storeRef = useStoreRef();
@@ -328,12 +367,23 @@ function useRecoilValueLoadable_LEGACY<T>(
 
   useEffect(() => {
     const store = storeRef.current;
-    const sub = subscribeToRecoilValue(
+    const storeState = store.getState();
+    const subscription = subscribeToRecoilValue(
       store,
       recoilValue,
       _state => {
         Tracing.trace('RecoilValue subscription fired', recoilValue.key, () => {
-          forceUpdate([]);
+          if (!gkx('recoil_suppress_rerender_in_callback')) {
+            return forceUpdate([]);
+          }
+          const newLoadable = getRecoilValueAsLoadable(
+            store,
+            recoilValue,
+            store.getState().currentTree,
+          );
+          if (!prevLoadableRef.current?.is(newLoadable)) {
+            forceUpdate(newLoadable);
+          }
         });
       },
       componentName,
@@ -355,22 +405,37 @@ function useRecoilValueLoadable_LEGACY<T>(
        * In this sequence we miss the update. To avoid that, add the update
        * to queuedComponentCallback if a batch is in progress.
        */
-      const state = store.getState();
-      if (state.nextTree) {
+      if (storeState.nextTree) {
         store.getState().queuedComponentCallbacks_DEPRECATED.push(
           Tracing.wrap(() => {
+            prevLoadableRef.current = null;
             forceUpdate([]);
           }),
         );
       } else {
-        forceUpdate([]);
+        if (!gkx('recoil_suppress_rerender_in_callback')) {
+          return forceUpdate([]);
+        }
+        const newLoadable = getRecoilValueAsLoadable(
+          store,
+          recoilValue,
+          store.getState().currentTree,
+        );
+        if (!prevLoadableRef.current?.is(newLoadable)) {
+          forceUpdate(newLoadable);
+        }
       }
     });
 
-    return () => sub.release(store);
-  }, [recoilValue, storeRef]);
+    return subscription.release;
+  }, [componentName, recoilValue, storeRef]);
 
-  return getRecoilValueAsLoadable(storeRef.current, recoilValue);
+  const loadable = getRecoilValueAsLoadable(storeRef.current, recoilValue);
+  const prevLoadableRef = useRef(loadable);
+  useEffect(() => {
+    prevLoadableRef.current = loadable;
+  });
+  return loadable;
 }
 
 /**
@@ -378,6 +443,10 @@ function useRecoilValueLoadable_LEGACY<T>(
   just undefined if not available for any reason, such as pending or error.
 */
 function useRecoilValueLoadable<T>(recoilValue: RecoilValue<T>): Loadable<T> {
+  if (gkx('recoil_memory_managament_2020')) {
+    // eslint-disable-next-line fb-www/react-hooks
+    useRetain(recoilValue);
+  }
   if (mutableSourceExists()) {
     // eslint-disable-next-line fb-www/react-hooks
     return useRecoilValueLoadable_MUTABLESOURCE(recoilValue);
@@ -395,10 +464,12 @@ function useRecoilValueLoadable<T>(recoilValue: RecoilValue<T>): Loadable<T> {
   */
 function useRecoilValue<T>(recoilValue: RecoilValue<T>): T {
   if (__DEV__) {
+    // $FlowFixMe[escaped-generic]
     validateRecoilValue(recoilValue, 'useRecoilValue');
   }
   const storeRef = useStoreRef();
   const loadable = useRecoilValueLoadable(recoilValue);
+  // $FlowFixMe[escaped-generic]
   return handleLoadable(loadable, recoilValue, storeRef);
 }
 
@@ -408,6 +479,7 @@ function useRecoilValue<T>(recoilValue: RecoilValue<T>): T {
 */
 function useSetRecoilState<T>(recoilState: RecoilState<T>): SetterOrUpdater<T> {
   if (__DEV__) {
+    // $FlowFixMe[escaped-generic]
     validateRecoilValue(recoilState, 'useSetRecoilState');
   }
   const storeRef = useStoreRef();
@@ -424,6 +496,7 @@ function useSetRecoilState<T>(recoilState: RecoilState<T>): SetterOrUpdater<T> {
 */
 function useResetRecoilState<T>(recoilState: RecoilState<T>): Resetter {
   if (__DEV__) {
+    // $FlowFixMe[escaped-generic]
     validateRecoilValue(recoilState, 'useResetRecoilState');
   }
   const storeRef = useStoreRef();
@@ -443,6 +516,7 @@ function useRecoilState<T>(
   recoilState: RecoilState<T>,
 ): [T, SetterOrUpdater<T>] {
   if (__DEV__) {
+    // $FlowFixMe[escaped-generic]
     validateRecoilValue(recoilState, 'useRecoilState');
   }
   return [useRecoilValue(recoilState), useSetRecoilState(recoilState)];
@@ -457,6 +531,7 @@ function useRecoilStateLoadable<T>(
   recoilState: RecoilState<T>,
 ): [Loadable<T>, SetterOrUpdater<T>] {
   if (__DEV__) {
+    // $FlowFixMe[escaped-generic]
     validateRecoilValue(recoilState, 'useRecoilStateLoadable');
   }
   return [useRecoilValueLoadable(recoilState), useSetRecoilState(recoilState)];
@@ -473,7 +548,7 @@ function useTransactionSubscription(callback: Store => void) {
 function externallyVisibleAtomValuesInState(
   state: TreeState,
 ): Map<NodeKey, mixed> {
-  const atomValues: Map<NodeKey, Loadable<mixed>> = state.atomValues;
+  const atomValues = state.atomValues.toMap();
   const persistedAtomContentsValues = mapMap(
     filterMap(atomValues, (v, k) => {
       const node = getNode(k);
@@ -488,7 +563,10 @@ function externallyVisibleAtomValuesInState(
   );
   // Merge in nonvalidated atoms; we may not have defs for them but they will
   // all have persistence on or they wouldn't be there in the first place.
-  return mergeMaps(state.nonvalidatedAtoms, persistedAtomContentsValues);
+  return mergeMaps(
+    state.nonvalidatedAtoms.toMap(),
+    persistedAtomContentsValues,
+  );
 }
 
 type ExternallyVisibleAtomInfo = {
@@ -585,14 +663,24 @@ function useRecoilTransactionObserver(
   useTransactionSubscription(
     useCallback(
       store => {
+        const snapshot = cloneSnapshot(store, 'current');
+        const previousSnapshot = cloneSnapshot(store, 'previous');
         callback({
-          snapshot: cloneSnapshot(store, 'current'),
-          previousSnapshot: cloneSnapshot(store, 'previous'),
+          snapshot,
+          previousSnapshot,
         });
       },
       [callback],
     ),
   );
+}
+
+function usePrevious<T>(value: T): T | void {
+  const ref = useRef();
+  useEffect(() => {
+    ref.current = value;
+  });
+  return ref.current;
 }
 
 // Return a snapshot of the current state and subscribe to all state changes
@@ -601,9 +689,32 @@ function useRecoilSnapshot(): Snapshot {
   const [snapshot, setSnapshot] = useState(() =>
     cloneSnapshot(storeRef.current),
   );
+  const previousSnapshot = usePrevious(snapshot);
+  const timeoutID = useRef();
+
+  useEffect(() => {
+    if (timeoutID.current && !isSSR) {
+      window.clearTimeout(timeoutID.current);
+    }
+    return snapshot.retain();
+  }, [snapshot]);
+
   useTransactionSubscription(
     useCallback(store => setSnapshot(cloneSnapshot(store)), []),
   );
+
+  if (previousSnapshot !== snapshot && !isSSR) {
+    if (timeoutID.current) {
+      previousSnapshot?.release();
+      window.clearTimeout(timeoutID.current);
+    }
+    snapshot.retain();
+    timeoutID.current = window.setTimeout(() => {
+      snapshot.release();
+      timeoutID.current = null;
+    }, SUSPENSE_TIMEOUT_MS);
+  }
+
   return snapshot;
 }
 
@@ -686,9 +797,6 @@ function useRecoilCallback<Args: $ReadOnlyArray<mixed>, Return>(
 
   return useCallback(
     (...args): Return => {
-      // Use currentTree for the snapshot to show the currently committed state
-      const snapshot = cloneSnapshot(storeRef.current);
-
       function set<T>(
         recoilState: RecoilState<T>,
         newValueOrUpdater: (T => T) | T,
@@ -700,10 +808,26 @@ function useRecoilCallback<Args: $ReadOnlyArray<mixed>, Return>(
         setRecoilValue(storeRef.current, recoilState, DEFAULT_VALUE);
       }
 
+      // Use currentTree for the snapshot to show the currently committed state
+      const snapshot = cloneSnapshot(storeRef.current);
       let ret = SENTINEL;
       batchUpdates(() => {
+        const errMsg =
+          'useRecoilCallback expects a function that returns a function: ' +
+          'it accepts a function of the type (RecoilInterface) => T = R ' +
+          'and returns a callback function T => R, where RecoilInterface is an ' +
+          'object {snapshot, set, ...} and T and R are the argument and return ' +
+          'types of the callback you want to create.  Please see the docs ' +
+          'at recoiljs.org for details.';
+        if (typeof fn !== 'function') {
+          throw new Error(errMsg);
+        }
         // flowlint-next-line unclear-type:off
-        ret = (fn: any)({set, reset, snapshot, gotoSnapshot})(...args);
+        const cb = (fn: any)({set, reset, snapshot, gotoSnapshot});
+        if (typeof cb !== 'function') {
+          throw new Error(errMsg);
+        }
+        ret = cb(...args);
       });
       invariant(
         !(ret instanceof Sentinel),
@@ -713,6 +837,86 @@ function useRecoilCallback<Args: $ReadOnlyArray<mixed>, Return>(
     },
     deps != null ? [...deps, storeRef] : undefined, // eslint-disable-line fb-www/react-hooks-deps
   );
+}
+
+// I don't see a way to avoid the any type here because we want to accept readable
+// and writable values with any type parameter, but normally with writable ones
+// RecoilState<SomeT> is not a subtype of RecoilState<mixed>.
+type ToRetain =
+  | RecoilValue<any> // flowlint-line unclear-type:off
+  | RetentionZone
+  | $ReadOnlyArray<RecoilValue<any> | RetentionZone>; // flowlint-line unclear-type:off
+
+function useRetain(toRetain: ToRetain): void {
+  if (!gkx('recoil_memory_managament_2020')) {
+    return;
+  }
+  // eslint-disable-next-line fb-www/react-hooks
+  return useRetain_ACTUAL(toRetain);
+}
+
+function useRetain_ACTUAL(toRetain: ToRetain): void {
+  const array = Array.isArray(toRetain) ? toRetain : [toRetain];
+  const retainables = array.map(a => (a instanceof RetentionZone ? a : a.key));
+  const storeRef = useStoreRef();
+  useEffect(() => {
+    if (!gkx('recoil_memory_managament_2020')) {
+      return;
+    }
+    const store = storeRef.current;
+    if (timeoutID.current && !isSSR) {
+      // Already performed a temporary retain on render, simply cancel the release
+      // of that temporary retain.
+      window.clearTimeout(timeoutID.current);
+      timeoutID.current = null;
+    } else {
+      // Log this since it's not clear that there's any scenario where it should happen.
+      recoverableViolation(
+        'Did not retain recoil value on render, or committed after timeout elapsed. This is fine, but odd.',
+        'recoil',
+      );
+      for (const r of retainables) {
+        updateRetainCount(store, r, 1);
+      }
+    }
+    return () => {
+      for (const r of retainables) {
+        updateRetainCount(store, r, -1);
+      }
+    };
+    // eslint-disable-next-line fb-www/react-hooks-deps
+  }, [storeRef, ...retainables]);
+
+  // We want to retain if the component suspends. This is terrible but the Suspense
+  // API affords us no better option. If we suspend and never commit after some
+  // seconds, then release. The 'actual' retain/release in the effect above
+  // cancels this.
+  const timeoutID = useRef();
+  const previousRetainables = usePrevious(retainables);
+  if (
+    !isSSR &&
+    (previousRetainables === undefined ||
+      !shallowArrayEqual(previousRetainables, retainables))
+  ) {
+    const store = storeRef.current;
+    for (const r of retainables) {
+      updateRetainCount(store, r, 1);
+    }
+    if (previousRetainables) {
+      for (const r of previousRetainables) {
+        updateRetainCount(store, r, -1);
+      }
+    }
+    if (timeoutID.current) {
+      window.clearTimeout(timeoutID.current);
+    }
+    timeoutID.current = window.setTimeout(() => {
+      timeoutID.current = null;
+      for (const r of retainables) {
+        updateRetainCount(store, r, -1);
+      }
+    }, SUSPENSE_TIMEOUT_MS);
+  }
 }
 
 module.exports = {
@@ -726,6 +930,7 @@ module.exports = {
   useRecoilTransactionObserver,
   useRecoilValue,
   useRecoilValueLoadable,
+  useRetain,
   useResetRecoilState,
   useSetRecoilState,
   useSetUnvalidatedAtomValues,

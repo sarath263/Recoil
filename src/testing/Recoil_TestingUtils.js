@@ -9,9 +9,10 @@
  * @format
  */
 'use strict';
-import type {RecoilValueReadOnly} from 'Recoil_RecoilValue';
-import type {RecoilState, RecoilValue} from 'Recoil_RecoilValue';
-import type {Store} from 'Recoil_State';
+
+import type {RecoilValueReadOnly} from '../core/Recoil_RecoilValue';
+import type {RecoilState, RecoilValue} from '../core/Recoil_RecoilValue';
+import type {Store} from '../core/Recoil_State';
 
 const React = require('React');
 const {useEffect} = require('React');
@@ -201,12 +202,16 @@ function componentThatReadsAndWritesAtom<T>(
 ): [() => React.Node, (T) => void, () => void] {
   let setValue;
   let resetValue;
-  const Component = (): React.Node => {
+  const ReadsAndWritesAtom = (): React.Node => {
     setValue = useSetRecoilState(atom);
     resetValue = useResetRecoilState(atom);
     return stableStringify(useRecoilValue(atom));
   };
-  return [Component, (value: T) => setValue(value), () => resetValue()];
+  return [
+    ReadsAndWritesAtom,
+    (value: T) => setValue(value),
+    () => resetValue(),
+  ];
 }
 
 function flushPromisesAndTimers(): Promise<void> {
@@ -221,6 +226,73 @@ function flushPromisesAndTimers(): Promise<void> {
   );
 }
 
+type ReloadImports = () => void | (() => void);
+type AssertionsFn = (gks: Array<string>) => ?Promise<mixed>;
+type TestOptions = {
+  gks?: Array<Array<string>>,
+};
+type TestFn = (string, AssertionsFn, TestOptions | void) => void;
+
+const testGKs = (
+  reloadImports: ReloadImports,
+  gks: Array<Array<string>>,
+): TestFn => (
+  testDescription: string,
+  assertionsFn: AssertionsFn,
+  {gks: additionalGKs = []}: TestOptions = {},
+) => {
+  test.each([
+    ...[...gks, ...additionalGKs].map(gks => [
+      !gks.length ? testDescription : `${testDescription} [${gks.join(', ')}]`,
+      gks,
+    ]),
+  ])('%s', async (_title, gks) => {
+    jest.resetModules();
+
+    const gkx = require('../util/Recoil_gkx');
+
+    gks.forEach(gkx.setPass);
+
+    const after = reloadImports();
+    await assertionsFn(gks);
+
+    gks.forEach(gkx.setFail);
+
+    after?.();
+  });
+};
+
+const WWW_GKS_TO_TEST = [
+  ['recoil_async_selector_refactor'],
+  ['recoil_suppress_rerender_in_callback'],
+  ['recoil_async_selector_refactor', 'recoil_suppress_rerender_in_callback'],
+  ['recoil_hamt_2020'],
+  ['recoil_memory_managament_2020'],
+  ['recoil_async_selector_refactor', 'recoil_memory_managament_2020'],
+  ['recoil_async_selector_refactor', 'recoil_hamt_2020'],
+];
+
+/**
+ * GK combinations to exclude in OSS, presumably because these combinations pass
+ * in FB internally but not in OSS. Ideally this array would be empty.
+ */
+const OSS_GK_COMBINATION_EXCLUSIONS = [];
+
+// eslint-disable-next-line no-unused-vars
+const OSS_GKS_TO_TEST = WWW_GKS_TO_TEST.filter(
+  gkCombination =>
+    !OSS_GK_COMBINATION_EXCLUSIONS.some(exclusion =>
+      exclusion.every(gk => gkCombination.includes(gk)),
+    ),
+);
+
+const getRecoilTestFn = (reloadImports: ReloadImports): TestFn =>
+  testGKs(
+    reloadImports,
+    // @fb-only: WWW_GKS_TO_TEST,
+    OSS_GKS_TO_TEST, // @oss-only
+  );
+
 module.exports = {
   makeStore,
   renderElements,
@@ -232,4 +304,5 @@ module.exports = {
   loadingAsyncSelector,
   asyncSelector,
   flushPromisesAndTimers,
+  getRecoilTestFn,
 };

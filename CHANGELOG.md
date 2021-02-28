@@ -1,5 +1,25 @@
 # Change Log
 
+## NEXT
+
+- Performance optimization to suppress re-rendering components:
+    - When subscribed selectors evaluate to the same value. (#749)
+    - On initial render when not using React Concurrent Mode (#820)
+- Added useGetRecoilValueInfo_UNSTABLE() hook for dev tools. (#713, #714)
+- Bug Fix: Ensuring that throwing non Error (and non Promise) objects is supported and puts the selector into a hasError state
+- Changed semantics of waitForAny() such that it will always return loadables unless everything is loading. This better aligns behaviour of waitForAny() and waitForNone()
+
+## 0.1.2 (2020-10-30)
+
+- Fix TypeScript exports
+
+## 0.1.1 (2020-10-29)
+
+- Performance Improvements
+- Experimental React Native support
+- Experimental Atom Effects
+- Experimental Snapshot construction
+
 ## 0.0.13 (2020-09-16)
 
 - Fix for bug affecting SSR

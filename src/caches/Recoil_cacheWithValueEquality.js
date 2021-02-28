@@ -34,9 +34,14 @@ const stableStringify = require('../util/Recoil_stableStringify');
 function cacheWithValueEquality<T>(): CacheImplementation<T> {
   const map: Map<mixed, T> = new Map();
   const cache = {
+    type: 'value',
     get: key => map.get(stableStringify(key)),
     set: (key, value: T) => {
       map.set(stableStringify(key), value);
+      return cache;
+    },
+    delete: key => {
+      map.delete(stableStringify(key));
       return cache;
     },
     map, // For debugging

@@ -28,14 +28,14 @@ const selectorFamily = require('./Recoil_selectorFamily');
 /////////////////
 //  TRUTH TABLE
 /////////////////
-// Dependencies        waitForNone         waitForAny        waitForAll
-//  [loading, loading]  [Promise, Promise]  Promise           Promise
-//  [value, loading]    [value, Promise]    [value, Promise]  Promise
-//  [value, value]      [value, value]      [value, value]    [value, value]
+// Dependencies        waitForNone         waitForAny        waitForAll       waitForAllSettled
+//  [loading, loading]  [Promise, Promise]  Promise           Promise         Promise
+//  [value, loading]    [value, Promise]    [value, Promise]  Promise         Promise
+//  [value, value]      [value, value]      [value, value]    [value, value]  [value, value]
 //
-//  [error, loading]    [Error, Promise]    Promise           Error
-//  [error, error]      [Error, Error]      Error             Error
-//  [value, error]      [value, Error]      [value, Error]    Error
+//  [error, loading]    [Error, Promise]    [Error, Promise]  Error           Promise
+//  [error, error]      [Error, Error]      [Error, Error]    Error           [error, error]
+//  [value, error]      [value, Error]      [value, Error]    Error           [value, error]
 
 // Issue parallel requests for all dependencies and return the current
 // status if they have results, have some error, or are still pending.
@@ -68,7 +68,11 @@ function unwrapDependencies(
 }
 
 function getValueFromLoadablePromiseResult(result) {
-  if (result.hasOwnProperty('__value')) {
+  if (
+    result != null &&
+    typeof result === 'object' &&
+    result.hasOwnProperty('__value')
+  ) {
     return result.__value;
   }
 
@@ -107,6 +111,22 @@ function wrapLoadables(
   return wrapResults(dependencies, output);
 }
 
+function combineAsyncResultsWithSyncResults<T>(
+  syncResults: Array<T>,
+  asyncResults: Array<T>,
+): Array<T> {
+  return asyncResults.map((result, idx) =>
+    /**
+     * it's important we use === undefined as opposed to == null, because the
+     * resolved value of the async promise could be `null`, in which case we
+     * don't want to use syncResults[idx], which would be undefined. If async
+     * promise resolves to `undefined`, that's ok because `syncResults[idx]`
+     * will also be `undefined`. That's a little hacky, but it works.
+     */
+    result === undefined ? syncResults[idx] : result,
+  );
+}
+
 // Selector that requests all dependencies in parallel and immediately returns
 // current results without waiting.
 const waitForNone: <
@@ -117,6 +137,7 @@ const waitForNone: <
   RecoilValues,
 ) => RecoilValueReadOnly<
   $ReadOnlyArray<Loadable<mixed>> | $ReadOnly<{[string]: Loadable<mixed>, ...}>,
+  // $FlowFixMe[incompatible-type-arg]
 > = selectorFamily({
   key: '__waitForNone',
   get: (
@@ -156,41 +177,33 @@ const waitForAny: <
     const deps = unwrapDependencies(dependencies);
     const [results, exceptions] = concurrentRequests(get, deps);
 
-    // If any results are available, return the current status
-    if (exceptions.some(exp => exp == null)) {
+    // If any results are available, value or error, return the current status
+    if (exceptions.some(exp => !isPromise(exp))) {
       return wrapLoadables(dependencies, results, exceptions);
-    }
-
-    // Since we are waiting for any results, only throw an error if all
-    // dependencies have an error.  Then, throw the first one.
-    if (exceptions.every(isError)) {
-      throw exceptions.find(isError);
     }
 
     if (gkx('recoil_async_selector_refactor')) {
       // Otherwise, return a promise that will resolve when the next result is
       // available, whichever one happens to be next.  But, if all pending
       // dependencies end up with errors, then reject the promise.
-      return new Promise((resolve, reject) => {
+      return new Promise(resolve => {
         for (const [i, exp] of exceptions.entries()) {
           if (isPromise(exp)) {
             exp
               .then(result => {
                 results[i] = getValueFromLoadablePromiseResult(result);
-                exceptions[i] = null;
+                exceptions[i] = undefined;
                 resolve(wrapLoadables(dependencies, results, exceptions));
               })
               .catch(error => {
                 exceptions[i] = error;
-                if (exceptions.every(isError)) {
-                  reject(exceptions[0]);
-                }
+                resolve(wrapLoadables(dependencies, results, exceptions));
               });
           }
         }
       });
     } else {
-      throw new Promise((resolve, reject) => {
+      throw new Promise(resolve => {
         for (const [i, exp] of exceptions.entries()) {
           if (isPromise(exp)) {
             exp
@@ -201,9 +214,7 @@ const waitForAny: <
               })
               .catch(error => {
                 exceptions[i] = error;
-                if (exceptions.every(isError)) {
-                  reject(exceptions[0]);
-                }
+                resolve(wrapLoadables(dependencies, results, exceptions));
               });
           }
         }
@@ -247,15 +258,87 @@ const waitForAll: <
 
     if (gkx('recoil_async_selector_refactor')) {
       // Otherwise, return a promise that will resolve when all results are available
-      return Promise.all(exceptions).then(results =>
+      return Promise.all(exceptions).then(exceptionResults =>
         wrapResults(
           dependencies,
-          results.map(getValueFromLoadablePromiseResult),
+          combineAsyncResultsWithSyncResults(results, exceptionResults).map(
+            getValueFromLoadablePromiseResult,
+          ),
         ),
       );
     } else {
       throw Promise.all(exceptions).then(results =>
         wrapResults(dependencies, results),
+      );
+    }
+  },
+});
+
+const waitForAllSettled: <
+  RecoilValues:
+    | $ReadOnlyArray<RecoilValueReadOnly<mixed>>
+    | $ReadOnly<{[string]: RecoilValueReadOnly<mixed>, ...}>,
+>(
+  RecoilValues,
+) => RecoilValueReadOnly<
+  $ReadOnlyArray<mixed> | $ReadOnly<{[string]: mixed, ...}>,
+> = selectorFamily({
+  key: '__waitForAllSettled',
+  get: (
+    dependencies:
+      | $ReadOnly<{[string]: RecoilValueReadOnly<mixed>}>
+      | $ReadOnlyArray<RecoilValueReadOnly<mixed>>,
+  ) => ({get}) => {
+    // Issue requests for all dependencies in parallel.
+    // Exceptions can either be Promises of pending results or real errors
+    const deps = unwrapDependencies(dependencies);
+    const [results, exceptions] = concurrentRequests(get, deps);
+
+    // If all results are available, return the results
+    if (exceptions.every(exp => !isPromise(exp))) {
+      return wrapLoadables(dependencies, results, exceptions);
+    }
+
+    // Wait for all results to settle
+    if (gkx('recoil_async_selector_refactor')) {
+      return (
+        Promise.all(
+          exceptions.map((exp, i) =>
+            isPromise(exp)
+              ? exp
+                  .then(result => {
+                    results[i] = getValueFromLoadablePromiseResult(result);
+                    exceptions[i] = undefined;
+                  })
+                  .catch(error => {
+                    results[i] = undefined;
+                    exceptions[i] = error;
+                  })
+              : null,
+          ),
+        )
+          // Then wrap them as loadables
+          .then(() => wrapLoadables(dependencies, results, exceptions))
+      );
+    } else {
+      throw (
+        Promise.all(
+          exceptions.map((exp, i) =>
+            isPromise(exp)
+              ? exp
+                  .then(result => {
+                    results[i] = getValueFromLoadablePromiseResult(result);
+                    exceptions[i] = undefined;
+                  })
+                  .catch(error => {
+                    results[i] = undefined;
+                    exceptions[i] = error;
+                  })
+              : null,
+          ),
+        )
+          // Then wrap them as loadables
+          .then(() => wrapLoadables(dependencies, results, exceptions))
       );
     }
   },
@@ -280,5 +363,6 @@ module.exports = {
   waitForNone,
   waitForAny,
   waitForAll,
+  waitForAllSettled,
   noWait,
 };

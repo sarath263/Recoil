@@ -10,9 +10,9 @@
  */
 'use strict';
 
-import type {RecoilValue} from '../core/Recoil_RecoilValue';
-import type {MutableSnapshot} from '../core/Recoil_Snapshot';
-import type {Store, StoreRef, StoreState} from '../core/Recoil_State';
+import type {RecoilValue} from './Recoil_RecoilValue';
+import type {MutableSnapshot} from './Recoil_Snapshot';
+import type {Store, StoreRef, StoreState} from './Recoil_State';
 
 const React = require('React');
 const {useContext, useEffect, useMemo, useRef, useState} = require('React');
@@ -22,25 +22,26 @@ const {useContext, useEffect, useMemo, useRef, useState} = require('React');
 
 const Queue = require('../adt/Recoil_Queue');
 const {
-  cleanUpNode,
-  getDownstreamNodes,
-  setNodeValue,
-  setUnvalidatedAtomValue_DEPRECATED,
-} = require('../core/Recoil_FunctionalCore');
-const {graph, saveDependencyMapToStore} = require('../core/Recoil_Graph');
-const {cloneGraph} = require('../core/Recoil_Graph');
-const {applyAtomValueWrites} = require('../core/Recoil_RecoilValueInterface');
-const {freshSnapshot} = require('../core/Recoil_Snapshot');
-const {
   getNextTreeStateVersion,
   makeEmptyStoreState,
 } = require('../core/Recoil_State');
-const {mapByDeletingMultipleFromMap} = require('../util/Recoil_CopyOnWrite');
+const expectationViolation = require('../util/Recoil_expectationViolation');
+const gkx = require('../util/Recoil_gkx');
 const nullthrows = require('../util/Recoil_nullthrows');
 // @fb-only: const recoverableViolation = require('../util/Recoil_recoverableViolation');
 const Tracing = require('../util/Recoil_Tracing');
 const unionSets = require('../util/Recoil_unionSets');
-// @fb-only: const gkx = require('gkx');
+const {
+  cleanUpNode,
+  getDownstreamNodes,
+  setNodeValue,
+  setUnvalidatedAtomValue_DEPRECATED,
+} = require('./Recoil_FunctionalCore');
+const {graph, saveDependencyMapToStore} = require('./Recoil_Graph');
+const {cloneGraph} = require('./Recoil_Graph');
+const {applyAtomValueWrites} = require('./Recoil_RecoilValueInterface');
+const {releaseScheduledRetainablesNow} = require('./Recoil_Retention');
+const {freshSnapshot} = require('./Recoil_Snapshot');
 
 type Props = {
   initializeState_DEPRECATED?: ({
@@ -95,7 +96,17 @@ const AppContext = React.createContext<StoreRef>({current: defaultStore});
 const useStoreRef = (): StoreRef => useContext(AppContext);
 
 const MutableSourceContext = React.createContext<mixed>(null); // TODO T2710559282599660
-const useRecoilMutableSource = (): mixed => useContext(MutableSourceContext);
+function useRecoilMutableSource(): mixed {
+  const mutableSource = useContext(MutableSourceContext);
+  if (mutableSource == null) {
+    expectationViolation(
+      'Attempted to use a Recoil hook outside of a <RecoilRoot>. ' +
+        '<RecoilRoot> must be an ancestor of any component that uses ' +
+        'Recoil hooks.',
+    );
+  }
+  return mutableSource;
+}
 
 function sendEndOfBatchNotifications(store: Store) {
   const storeState = store.getState();
@@ -193,6 +204,10 @@ function Batcher(props: {setNotifyBatcherOfChange: (() => void) => void}) {
       const discardedVersion = nullthrows(storeState.previousTree).version;
       storeState.graphsByVersion.delete(discardedVersion);
       storeState.previousTree = null;
+
+      if (gkx('recoil_memory_managament_2020')) {
+        releaseScheduledRetainablesNow(storeRef.current);
+      }
     });
   });
 
@@ -210,6 +225,7 @@ if (__DEV__) {
 function initialStoreState_DEPRECATED(store, initializeState): StoreState {
   const initial: StoreState = makeEmptyStoreState();
   initializeState({
+    // $FlowFixMe[escaped-generic]
     set: (atom, value) => {
       const state = initial.currentTree;
       const [depMap, writes] = setNodeValue(store, state, atom.key, value);
@@ -217,10 +233,10 @@ function initialStoreState_DEPRECATED(store, initializeState): StoreState {
 
       saveDependencyMapToStore(depMap, store, state.version);
 
-      const nonvalidatedAtoms = mapByDeletingMultipleFromMap(
-        state.nonvalidatedAtoms,
-        writtenNodes,
-      );
+      const nonvalidatedAtoms = state.nonvalidatedAtoms.clone();
+      for (const n of writtenNodes) {
+        nonvalidatedAtoms.delete(n);
+      }
 
       initial.currentTree = {
         ...state,

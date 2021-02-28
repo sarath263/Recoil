@@ -29,30 +29,36 @@ export type ResolvedLoadablePromiseInfo<+T> = $ReadOnly<{
   __key?: NodeKey,
 }>;
 
-export type LoadablePromise<+T> = Promise<ResolvedLoadablePromiseInfo<T>>;
+class Canceled {}
+const CANCELED: Canceled = new Canceled();
+
+export type LoadablePromise<+T> = Promise<
+  ResolvedLoadablePromiseInfo<T> | Canceled,
+>;
 
 type Accessors<T> = $ReadOnly<{
   // Attempt to get the value.
   // If there's an error, throw an error.  If it's still loading, throw a Promise
   // This is useful for composing with React Suspense or in a Recoil Selector.
   getValue: () => T,
-
   toPromise: () => Promise<T>,
 
   // Convenience accessors
   valueMaybe: () => T | void,
   valueOrThrow: () => T,
-  errorMaybe: () => Error | void,
-  errorOrThrow: () => Error,
+  errorMaybe: () => mixed | void,
+  errorOrThrow: () => mixed,
   promiseMaybe: () => Promise<T> | void,
   promiseOrThrow: () => Promise<T>,
+
+  is: (Loadable<mixed>) => boolean,
 
   map: <T, S>(map: (T) => Promise<S> | S) => Loadable<S>,
 }>;
 
 export type Loadable<+T> =
   | $ReadOnly<{state: 'hasValue', contents: T, ...Accessors<T>}>
-  | $ReadOnly<{state: 'hasError', contents: Error, ...Accessors<T>}>
+  | $ReadOnly<{state: 'hasError', contents: mixed, ...Accessors<T>}>
   | $ReadOnly<{
       state: 'loading',
       contents: LoadablePromise<T>,
@@ -94,7 +100,12 @@ const loadableAccessors = {
 
   valueOrThrow() {
     if (this.state !== 'hasValue') {
-      throw new Error(`Loadable expected value, but in "${this.state}" state`);
+      const error = new Error(
+        `Loadable expected value, but in "${this.state}" state`,
+      );
+      // V8 keeps closures alive until stack is accessed, this prevents a memory leak
+      error.stack;
+      throw error;
     }
     return this.contents;
   },
@@ -105,7 +116,12 @@ const loadableAccessors = {
 
   errorOrThrow() {
     if (this.state !== 'hasError') {
-      throw new Error(`Loadable expected error, but in "${this.state}" state`);
+      const error = new Error(
+        `Loadable expected error, but in "${this.state}" state`,
+      );
+      // V8 keeps closures alive until stack is accessed, this prevents a memory leak
+      error.stack;
+      throw error;
     }
     return this.contents;
   },
@@ -120,14 +136,21 @@ const loadableAccessors = {
 
   promiseOrThrow(): Promise<$FlowFixMe> {
     if (this.state !== 'loading') {
-      throw new Error(
+      const error = new Error(
         `Loadable expected promise, but in "${this.state}" state`,
       );
+      // V8 keeps closures alive until stack is accessed, this prevents a memory leak
+      error.stack;
+      throw error;
     }
 
     return gkx('recoil_async_selector_refactor')
       ? (this.contents: Promise<$FlowFixMe>).then(({__value}) => __value)
       : (this.contents: Promise<$FlowFixMe>);
+  },
+
+  is(other: Loadable<mixed>): boolean {
+    return other.state === this.state && other.contents === this.contents;
   },
 
   // TODO Unit tests
@@ -166,7 +189,10 @@ const loadableAccessors = {
           }),
       );
     }
-    throw new Error('Invalid Loadable state');
+    const error = new Error('Invalid Loadable state');
+    // V8 keeps closures alive until stack is accessed, this prevents a memory leak
+    error.stack;
+    throw error;
   },
 };
 
@@ -179,7 +205,7 @@ function loadableWithValue<T>(value: T): Loadable<T> {
   });
 }
 
-function loadableWithError<T>(error: Error): Loadable<T> {
+function loadableWithError<T>(error: mixed): Loadable<T> {
   return Object.freeze({
     state: 'hasError',
     contents: error,
@@ -206,7 +232,6 @@ function loadableAll<Inputs: $ReadOnlyArray<Loadable<mixed>>>(
     ? loadableWithValue(inputs.map(i => i.contents))
     : inputs.some(i => i.state === 'hasError')
     ? loadableWithError(
-        // $FlowIssue[incompatible-call] #44070740 Array.find should refine parameter
         nullthrows(
           inputs.find(i => i.state === 'hasError'),
           'Invalid loadable passed to loadableAll',
@@ -227,4 +252,6 @@ module.exports = {
   loadableWithPromise,
   loadableLoading,
   loadableAll,
+  Canceled,
+  CANCELED,
 };

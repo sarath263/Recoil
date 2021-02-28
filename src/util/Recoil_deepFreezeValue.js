@@ -14,7 +14,7 @@
  */
 'use strict';
 
-const isArrayBufferView = require('./Recoil_isArrayBufferView');
+const {isReactNative, isSSR} = require('./Recoil_Environment');
 const isNode = require('./Recoil_isNode');
 const isPromise = require('./Recoil_isPromise');
 
@@ -52,7 +52,21 @@ function shouldNotBeFrozen(value: mixed): boolean {
     return true;
   }
 
-  if (isArrayBufferView(value)) {
+  if (value instanceof Error) {
+    return true;
+  }
+
+  if (ArrayBuffer.isView(value)) {
+    return true;
+  }
+
+  // Some environments, just as Jest, don't work with the instanceof check
+  if (
+    !isSSR &&
+    !isReactNative &&
+    // $FlowFixMe(site=recoil) Window does not have a FlowType definition https://github.com/facebook/flow/issues/6709
+    (value === window || value instanceof Window)
+  ) {
     return true;
   }
 

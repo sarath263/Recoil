@@ -63,16 +63,16 @@ import type {
   RecoilValue,
   RecoilValueReadOnly,
 } from '../core/Recoil_RecoilValue';
-import type {AtomValues, NodeKey, Store, TreeState} from '../core/Recoil_State';
+import type {RetainedBy} from '../core/Recoil_RetainedBy';
+import type {AtomWrites, NodeKey, Store, TreeState} from '../core/Recoil_State';
 
 const {
+  CANCELED,
+  Canceled,
   loadableWithError,
   loadableWithPromise,
   loadableWithValue,
 } = require('../adt/Recoil_Loadable');
-const cacheMostRecent = require('../caches/Recoil_cacheMostRecent');
-const cacheWithReferenceEquality = require('../caches/Recoil_cacheWithReferenceEquality');
-const cacheWithValueEquality = require('../caches/Recoil_cacheWithValueEquality');
 const nodeCacheMostRecent = require('../caches/Recoil_nodeCacheMostRecent');
 const treeCacheReferenceEquality = require('../caches/Recoil_treeCacheReferenceEquality');
 const treeCacheValueEquality = require('../caches/Recoil_treeCacheValueEquality');
@@ -85,15 +85,19 @@ const {saveDependencyMapToStore} = require('../core/Recoil_Graph');
 const {
   DEFAULT_VALUE,
   RecoilValueNotReady,
+  getConfigDeletionHandler,
   registerNode,
 } = require('../core/Recoil_Node');
 const {isRecoilValue} = require('../core/Recoil_RecoilValue');
 const {AbstractRecoilValue} = require('../core/Recoil_RecoilValue');
 const {setRecoilValueLoadable} = require('../core/Recoil_RecoilValueInterface');
+const {retainedByOptionWithDefault} = require('../core/Recoil_Retention');
 const deepFreezeValue = require('../util/Recoil_deepFreezeValue');
+const gkx = require('../util/Recoil_gkx');
 const isPromise = require('../util/Recoil_isPromise');
 const nullthrows = require('../util/Recoil_nullthrows');
 const {startPerfBlock} = require('../util/Recoil_PerformanceTimings');
+const recoverableViolation = require('../util/Recoil_recoverableViolation');
 
 export type ValueOrUpdater<T> =
   | T
@@ -107,6 +111,7 @@ type ReadOnlySelectorOptions<T> = $ReadOnly<{
   key: string,
   get: ({get: GetRecoilValue}) => Promise<T> | RecoilValue<T> | T,
 
+  retainedBy_UNSTABLE?: RetainedBy,
   cacheImplementation_UNSTABLE?: CacheImplementation<Loadable<T>>,
   dangerouslyAllowMutability?: boolean,
 }>;
@@ -193,21 +198,49 @@ function selector<T>(
   const set = options.set != null ? options.set : undefined; // flow
 
   /**
-   * HACK: doing this as a way to map given cache to corresponding tree cache
+   * HACK: doing this as a way to map given cache to corresponding tree cache.
+   * Current implementation does not allow custom cache implementations. Custom
+   * caches have a type 'custom' and fall back to reference equality.
    */
-  const cache: NodeCache<T> =
-    cacheImplementation === cacheWithReferenceEquality
-      ? treeCacheReferenceEquality()
-      : cacheImplementation === cacheWithValueEquality
-      ? treeCacheValueEquality()
-      : cacheImplementation === cacheMostRecent
-      ? nodeCacheMostRecent()
-      : treeCacheReferenceEquality();
+  const cache: NodeCache<T> = !cacheImplementation
+    ? treeCacheReferenceEquality()
+    : cacheImplementation.type === 'reference'
+    ? treeCacheReferenceEquality()
+    : cacheImplementation.type === 'value'
+    ? treeCacheValueEquality()
+    : cacheImplementation.type === 'mostRecent'
+    ? nodeCacheMostRecent()
+    : treeCacheReferenceEquality();
 
-  const executionInfo: ExecutionInfo<T> = getInitialExecutionInfo();
+  const retainedBy = retainedByOptionWithDefault(options.retainedBy_UNSTABLE);
 
-  function initSelector(store: Store) {
-    store.getState().knownSelectors.add(key);
+  const executionInfoMap: Map<Store, ExecutionInfo<T>> = new Map();
+  let liveStoresCount = 0;
+
+  function selectorIsLive() {
+    return !gkx('recoil_memory_managament_2020') || liveStoresCount > 0;
+  }
+
+  function getExecutionInfo(store: Store): ExecutionInfo<T> {
+    if (!executionInfoMap.has(store)) {
+      executionInfoMap.set(store, getInitialExecutionInfo());
+    }
+
+    return nullthrows(executionInfoMap.get(store));
+  }
+
+  function selectorInit(store: Store): () => void {
+    liveStoresCount++;
+    store.getState().knownSelectors.add(key); // FIXME remove knownSelectors?
+    return () => {
+      liveStoresCount--;
+      store.getState().knownSelectors.delete(key);
+      executionInfoMap.delete(store);
+    };
+  }
+
+  function selectorShouldDeleteConfigOnRelease() {
+    return getConfigDeletionHandler(key) !== undefined && !selectorIsLive();
   }
 
   function notifyStoreWhenAsyncSettles(
@@ -226,10 +259,6 @@ function selector<T>(
     }
   }
 
-  /**
-   * FIXME: we should keep track of latest execution id _per store_ and update
-   * the stores accordingly.
-   */
   function notifyStoresOfSettledAsync(
     newLoadable: Loadable<T>,
     executionId: ExecutionId,
@@ -306,21 +335,31 @@ function selector<T>(
   ): LoadablePromise<T> {
     return promise
       .then(value => {
+        if (!selectorIsLive()) {
+          // The selector was released since the request began; ignore the response.
+          clearExecutionInfo(store, executionId);
+          return CANCELED;
+        }
+
         const loadable = loadableWithValue(value);
 
         maybeFreezeValue(value);
         setCache(state, depValuesToDepRoute(depValues), loadable);
+        setDepsInStore(store, state, new Set(depValues.keys()), executionId);
 
-        if (isLatestExecution(executionId)) {
-          setLoadableInStoreToNotifyDeps(loadable, executionId);
-          setExecutionInfo(loadable);
-        }
+        setLoadableInStoreToNotifyDeps(store, loadable, executionId);
 
         return {__value: value, __key: key};
       })
       .catch(errorOrPromise => {
-        if (isLatestExecution(executionId)) {
-          updateExecutionInfoDepValues(depValues, executionId);
+        if (!selectorIsLive()) {
+          // The selector was released since the request began; ignore the response.
+          clearExecutionInfo(store, executionId);
+          return CANCELED;
+        }
+
+        if (isLatestExecution(store, executionId)) {
+          updateExecutionInfoDepValues(depValues, store, executionId);
         }
 
         if (isPromise(errorOrPromise)) {
@@ -337,11 +376,9 @@ function selector<T>(
 
         maybeFreezeValue(errorOrPromise);
         setCache(state, depValuesToDepRoute(depValues), loadable);
+        setDepsInStore(store, state, new Set(depValues.keys()), executionId);
 
-        if (isLatestExecution(executionId)) {
-          setLoadableInStoreToNotifyDeps(loadable, executionId);
-          setExecutionInfo(loadable);
-        }
+        setLoadableInStoreToNotifyDeps(store, loadable, executionId);
 
         throw errorOrPromise;
       });
@@ -386,7 +423,28 @@ function selector<T>(
   ): LoadablePromise<T> {
     return promise
       .then(resolvedDep => {
-        const {__key: resolvedDepKey, __value: depValue} = resolvedDep;
+        if (!selectorIsLive()) {
+          // The selector was released since the request began; ignore the response.
+          clearExecutionInfo(store, executionId);
+          return CANCELED;
+        }
+
+        if (resolvedDep instanceof Canceled) {
+          recoverableViolation(
+            'Selector was released while it had dependencies',
+            'recoil',
+          );
+          return CANCELED;
+        }
+
+        const {__key: resolvedDepKey, __value: depValue} = resolvedDep ?? {};
+
+        /**
+         * We need to bypass the selector dep cache if the resolved dep was a
+         * user-thrown promise because the selector dep cache will contain the
+         * stale values of dependencies, causing an infinite evaluation loop.
+         */
+        let bypassSelectorDepCacheOnReevaluation = true;
 
         if (resolvedDepKey != null) {
           /**
@@ -397,27 +455,31 @@ function selector<T>(
            * in Recoil_atom.js)
            */
           state.atomValues.set(resolvedDepKey, loadableWithValue(depValue));
+
+          /**
+           * We've added the resolved dependency to the selector dep cache, so
+           * there's no need to bypass the cache
+           */
+          bypassSelectorDepCacheOnReevaluation = false;
         }
 
         const [loadable, depValues] = evaluateSelectorGetter(
           store,
           state,
           executionId,
+          bypassSelectorDepCacheOnReevaluation,
         );
 
-        if (isLatestExecution(executionId)) {
-          updateExecutionInfoDepValues(depValues, executionId);
+        if (isLatestExecution(store, executionId)) {
+          updateExecutionInfoDepValues(depValues, store, executionId);
         }
 
         maybeFreezeLoadableContents(loadable);
 
         if (loadable.state !== 'loading') {
           setCache(state, depValuesToDepRoute(depValues), loadable);
-        }
-
-        if (loadable.state !== 'loading' && isLatestExecution(executionId)) {
-          setLoadableInStoreToNotifyDeps(loadable, executionId);
-          setExecutionInfo(loadable);
+          setDepsInStore(store, state, new Set(depValues.keys()), executionId);
+          setLoadableInStoreToNotifyDeps(store, loadable, executionId);
         }
 
         if (loadable.state === 'hasError') {
@@ -436,6 +498,12 @@ function selector<T>(
         return loadable.contents;
       })
       .catch(error => {
+        if (!selectorIsLive()) {
+          // The selector was released since the request began; ignore the response.
+          clearExecutionInfo(store, executionId);
+          return CANCELED;
+        }
+
         const loadable = loadableWithError(error);
 
         maybeFreezeValue(error);
@@ -444,21 +512,21 @@ function selector<T>(
           depValuesToDepRoute(existingDeps),
           loadableWithError(error),
         );
+        setDepsInStore(store, state, new Set(existingDeps.keys()), executionId);
 
-        if (isLatestExecution(executionId)) {
-          setLoadableInStoreToNotifyDeps(loadable, executionId);
-          setExecutionInfo(loadable);
-        }
+        setLoadableInStoreToNotifyDeps(store, loadable, executionId);
 
         throw error;
       });
   }
 
   function setLoadableInStoreToNotifyDeps(
+    store: Store,
     loadable: Loadable<T>,
     executionId: ExecutionId,
   ): void {
-    if (isLatestExecution(executionId)) {
+    if (isLatestExecution(store, executionId)) {
+      setExecutionInfo(loadable, store);
       notifyStoresOfSettledAsync(loadable, executionId);
     }
   }
@@ -470,7 +538,7 @@ function selector<T>(
     executionId: ?ExecutionId,
   ): void {
     if (
-      isLatestExecution(executionId) ||
+      isLatestExecution(store, executionId) ||
       state.version === store.getState()?.currentTree?.version ||
       state.version === store.getState()?.nextTree?.version
     ) {
@@ -499,9 +567,11 @@ function selector<T>(
     store: Store,
     state: TreeState,
     executionId: ExecutionId,
+    bypassSelectorDepCache?: boolean = false,
   ): [Loadable<T>, DepValues] {
     const endPerfBlock = startPerfBlock(key); // TODO T63965866: use execution ID here
     let result;
+    let resultIsError = false;
     let loadable: Loadable<T>;
 
     const depValues = new Map();
@@ -525,7 +595,9 @@ function selector<T>(
 
       setNewDepInStore(store, state, deps, depKey, executionId);
 
-      const [, depLoadable] = getCachedNodeLoadable(store, state, depKey);
+      const [, depLoadable] = bypassSelectorDepCache
+        ? getNodeLoadable(store, state, depKey)
+        : getCachedNodeLoadable(store, state, depKey);
 
       depValues.set(depKey, depLoadable);
 
@@ -563,11 +635,12 @@ function selector<T>(
           executionId,
         ).finally(endPerfBlock);
       } else {
+        resultIsError = true;
         endPerfBlock();
       }
     }
 
-    if (result instanceof Error) {
+    if (resultIsError) {
       loadable = loadableWithError(result);
     } else if (isPromise(result)) {
       loadable = loadableWithPromise<T>(result);
@@ -584,15 +657,9 @@ function selector<T>(
     store: Store,
     state: TreeState,
   ): ?Loadable<T> {
-    if (state.atomValues.has(key)) {
-      return state.atomValues.get(key);
-    }
+    const depsAfterCacheDone = new Set();
 
-    const deps = new Set(
-      store.getGraph(state.version).nodeDeps.get(key) ?? emptySet,
-    );
-
-    setDepsInStore(store, state, deps, executionInfo.latestExecutionId);
+    const executionInfo = getExecutionInfo(store);
 
     const cachedVal = cache.get(
       nodeKey => {
@@ -603,17 +670,28 @@ function selector<T>(
       {
         onCacheHit: nodeKey => {
           if (nodeKey !== key) {
-            setNewDepInStore(
-              store,
-              state,
-              deps,
-              nodeKey,
-              executionInfo.latestExecutionId,
-            );
+            depsAfterCacheDone.add(nodeKey);
           }
         },
       },
     );
+
+    /**
+     * Ensure store contains correct dependencies if we hit the cache so that
+     * the store deps and cache are in sync for a given state. This is important
+     * because store deps are normally updated when new executions are created,
+     * but cache hits don't trigger new executions but they still _may_ signifiy
+     * a change in deps in the store if the store deps for this state are empty
+     * or stale.
+     */
+    if (cachedVal) {
+      setDepsInStore(
+        store,
+        state,
+        depsAfterCacheDone,
+        executionInfo.latestExecutionId,
+      );
+    }
 
     return cachedVal;
   }
@@ -648,7 +726,7 @@ function selector<T>(
       newExecutionId,
     );
 
-    setExecutionInfo(loadable, newDepValues, newExecutionId, state);
+    setExecutionInfo(loadable, store, newDepValues, newExecutionId, state);
     maybeSetCacheWithLoadable(
       state,
       depValuesToDepRoute(newDepValues),
@@ -685,17 +763,25 @@ function selector<T>(
     const cachedVal = getValFromCacheAndUpdatedDownstreamDeps(store, state);
 
     if (cachedVal != null) {
-      setExecutionInfo(cachedVal);
+      setExecutionInfo(cachedVal, store);
       return cachedVal;
     }
 
+    const inProgressExecutionInfo = getExecutionInfoOfInProgressExecution(
+      store,
+      state,
+    );
+
     // FIXME: this won't work with custom caching b/c it uses separate cache
-    if (asyncWorkIsInProgressAndDepsDiscoveredHaveNotChanged(store, state)) {
+    if (inProgressExecutionInfo) {
+      const executionInfo = inProgressExecutionInfo;
+
       notifyStoreWhenAsyncSettles(
         store,
         nullthrows(executionInfo.latestLoadable),
         nullthrows(executionInfo.latestExecutionId),
       );
+
       // FIXME: check after the fact to see if we made the right choice by waiting
       return nullthrows(executionInfo.latestLoadable);
     }
@@ -703,20 +789,31 @@ function selector<T>(
     return getValFromRunningNewExecutionAndUpdatedDeps(store, state);
   }
 
-  function asyncWorkIsInProgressAndDepsDiscoveredHaveNotChanged(
+  /**
+   * Searches execution info across all stores to see if there is an in-progress
+   * execution whose dependency values match the values of the requesting store.
+   */
+  function getExecutionInfoOfInProgressExecution(
     store: Store,
     state: TreeState,
-  ) {
-    return (
-      executionInfo.latestLoadable != null &&
-      executionInfo.latestExecutionId != null &&
-      !haveAsyncDepsChanged(store, state)
-    );
+  ): ?ExecutionInfo<T> {
+    const [, executionInfo] =
+      Array.from(executionInfoMap.entries()).find(([, executionInfo]) => {
+        return (
+          executionInfo.latestLoadable != null &&
+          executionInfo.latestExecutionId != null &&
+          !haveAsyncDepsChanged(store, state)
+        );
+      }) ?? [];
+
+    return executionInfo;
   }
 
   const mapOfCheckedVersions = new Map();
 
   function haveAsyncDepsChanged(store: Store, state: TreeState): boolean {
+    const executionInfo = getExecutionInfo(store);
+
     const oldDepValues =
       executionInfo.depValuesDiscoveredSoFarDuringAsyncWork ?? new Map();
 
@@ -773,10 +870,13 @@ function selector<T>(
    */
   function setExecutionInfo(
     loadable: Loadable<T>,
+    store: Store,
     depValues?: DepValues,
     newExecutionId?: ExecutionId,
     state?: TreeState,
   ) {
+    const executionInfo = getExecutionInfo(store);
+
     if (loadable.state === 'loading') {
       executionInfo.depValuesDiscoveredSoFarDuringAsyncWork = depValues;
       executionInfo.latestExecutionId = newExecutionId;
@@ -813,14 +913,25 @@ function selector<T>(
 
   function updateExecutionInfoDepValues(
     depValues: DepValues,
+    store: Store,
     executionId: ExecutionId,
   ) {
-    if (isLatestExecution(executionId)) {
+    const executionInfo = getExecutionInfo(store);
+
+    if (isLatestExecution(store, executionId)) {
       executionInfo.depValuesDiscoveredSoFarDuringAsyncWork = depValues;
     }
   }
 
-  function isLatestExecution(executionId): boolean {
+  function clearExecutionInfo(store: Store, executionId: ExecutionId) {
+    if (isLatestExecution(store, executionId)) {
+      executionInfoMap.delete(store);
+    }
+  }
+
+  function isLatestExecution(store: Store, executionId): boolean {
+    const executionInfo = getExecutionInfo(store);
+
     return executionId === executionInfo.latestExecutionId;
   }
 
@@ -852,7 +963,6 @@ function selector<T>(
       const message = `Recoil selector has circular dependencies: ${dependencyStack
         .slice(dependencyStack.indexOf(key))
         .join(' \u2192 ')}`;
-      // eslint-disable-next-line fb-www/no-new-error
       return loadableWithError(new Error(message));
     }
     dependencyStack.push(key);
@@ -863,7 +973,7 @@ function selector<T>(
     }
   }
 
-  function myPeek(store: Store, state: TreeState): ?Loadable<T> {
+  function selectorPeek(store: Store, state: TreeState): ?Loadable<T> {
     const cacheVal = cache.get(nodeKey => {
       const peek = peekNodeLoadable(store, state, nodeKey);
 
@@ -873,9 +983,10 @@ function selector<T>(
     return cacheVal;
   }
 
-  function myGet(store: Store, state: TreeState): [DependencyMap, Loadable<T>] {
-    initSelector(store);
-
+  function selectorGet(
+    store: Store,
+    state: TreeState,
+  ): [DependencyMap, Loadable<T>] {
     return [
       new Map(),
       detectCircularDependencies(() =>
@@ -884,18 +995,23 @@ function selector<T>(
     ];
   }
 
-  function invalidate(state: TreeState) {
+  function invalidateSelector(state: TreeState) {
     state.atomValues.delete(key);
   }
 
   if (set != null) {
-    function mySet(store, state, newValue): [DependencyMap, AtomValues] {
-      initSelector(store);
-
+    function selectorSet(store, state, newValue): [DependencyMap, AtomWrites] {
+      let syncSelectorSetFinished = false;
       const dependencyMap: DependencyMap = new Map();
-      const writes: AtomValues = new Map();
+      const writes: AtomWrites = new Map();
 
       function getRecoilValue<S>({key}: RecoilValue<S>): S {
+        if (syncSelectorSetFinished) {
+          throw new Error(
+            'Recoil: Async selector sets are not currently supported.',
+          );
+        }
+
         const [, loadable] = getCachedNodeLoadable(store, state, key);
 
         if (loadable.state === 'hasValue') {
@@ -911,6 +1027,12 @@ function selector<T>(
         recoilState: RecoilState<S>,
         valueOrUpdater: S | DefaultValue | ((S, GetRecoilValue) => S),
       ) {
+        if (syncSelectorSetFinished) {
+          throw new Error(
+            'Recoil: Async selector sets are not currently supported.',
+          );
+        }
+
         const newValue =
           typeof valueOrUpdater === 'function'
             ? // cast to any because we can't restrict type S from being a function itself without losing support for opaque types
@@ -932,33 +1054,47 @@ function selector<T>(
         setRecoilState(recoilState, DEFAULT_VALUE);
       }
 
-      set(
+      const ret = set(
         {set: setRecoilState, get: getRecoilValue, reset: resetRecoilState},
         newValue,
       );
 
+      // set should be a void method, but if the user makes it `async`, then it
+      // will return a Promise, which we don't currently support.
+      if (ret !== undefined) {
+        throw isPromise(ret)
+          ? new Error(
+              'Recoil: Async selector sets are not currently supported.',
+            )
+          : new Error('Recoil: selector set should be a void function.');
+      }
+      syncSelectorSetFinished = true;
       return [dependencyMap, writes];
     }
 
     return registerNode<T>({
       key,
-      peek: myPeek,
-      get: myGet,
-      set: mySet,
-      cleanUp: () => {},
-      invalidate,
+      peek: selectorPeek,
+      get: selectorGet,
+      set: selectorSet,
+      init: selectorInit,
+      invalidate: invalidateSelector,
+      shouldDeleteConfigOnRelease: selectorShouldDeleteConfigOnRelease,
       dangerouslyAllowMutability: options.dangerouslyAllowMutability,
       shouldRestoreFromSnapshots: false,
+      retainedBy,
     });
   } else {
     return registerNode<T>({
       key,
-      peek: myPeek,
-      get: myGet,
-      cleanUp: () => {},
-      invalidate,
+      peek: selectorPeek,
+      get: selectorGet,
+      init: selectorInit,
+      invalidate: invalidateSelector,
+      shouldDeleteConfigOnRelease: selectorShouldDeleteConfigOnRelease,
       dangerouslyAllowMutability: options.dangerouslyAllowMutability,
       shouldRestoreFromSnapshots: false,
+      retainedBy,
     });
   }
 }

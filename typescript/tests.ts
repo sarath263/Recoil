@@ -1,34 +1,22 @@
 import {
-  DefaultValue,
-  RecoilRoot,
-  RecoilBridge,
-  RecoilValueReadOnly,
   atom,
-  selector,
-  useRecoilValue,
-  useRecoilValueLoadable,
-  useRecoilState,
-  useRecoilStateLoadable,
-  useSetRecoilState,
-  useResetRecoilState,
-  useRecoilCallback,
-  isRecoilValue,
-  RecoilState,
   atomFamily,
+  constSelector, DefaultValue,
+  errorSelector, isRecoilValue,
+  noWait, readOnlySelector, RecoilBridge, RecoilRoot,
+  RecoilState, RecoilValueReadOnly,
+  selector,
   selectorFamily,
-  constSelector,
-  errorSelector,
-  readOnlySelector,
-  noWait,
-  waitForNone,
-  waitForAny,
-  waitForAll,
-  useRecoilTransactionObserver_UNSTABLE,
-  useGotoRecoilSnapshot,
   Snapshot,
-  SnapshotID, // eslint-disable-line @typescript-eslint/no-unused-vars
-  useRecoilSnapshot,
-  useRecoilBridgeAcrossReactRoots_UNSTABLE,
+  snapshot_UNSTABLE,
+  useGetRecoilValueInfo_UNSTABLE, useGotoRecoilSnapshot,
+  useRecoilBridgeAcrossReactRoots_UNSTABLE, useRecoilCallback,
+  useRecoilSnapshot, useRecoilState,
+  useRecoilStateLoadable,
+  useRecoilTransactionObserver_UNSTABLE, useRecoilValue,
+  useRecoilValueLoadable,
+  useResetRecoilState, useSetRecoilState,
+  waitForAll, waitForAllSettled, waitForAny, waitForNone
 } from 'recoil';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -65,13 +53,14 @@ const readOnlySelectorSel = selector({
       get(myAtom) + 10;
       get(mySelector1);
       get(5); // $ExpectError
+      return 5;
   },
 });
 
 const writeableSelector = selector({
   key: 'WriteableSelector',
   get: ({ get }) => {
-    get(mySelector1) + 10;
+    return get(mySelector1) + 10;
   },
   set: ({ get, set, reset }) => {
     get(myAtom);
@@ -93,7 +82,7 @@ RecoilRoot({
     reset(myAtom);
 
     set(readOnlySelectorSel, 2); // $ExpectError
-    set(writeableSelector, 10); // $ExpectError
+    set(writeableSelector, 10);
     setUnvalidatedAtomValues({}); // $ExpectError
     set(writeableSelector, new DefaultValue());
   },
@@ -104,31 +93,31 @@ const roAtom: RecoilValueReadOnly<string> = {} as any;
 const waAtom: RecoilState<string> = {} as any;
 const nsAtom: RecoilState<number | string> = {} as any; // number or string
 
-useRecoilValue(roAtom);
-useRecoilValue(waAtom);
+useRecoilValue(roAtom); // $ExpectType string
+useRecoilValue(waAtom); // $ExpectType string
 
 useRecoilState(roAtom); // $ExpectError
-useRecoilState(waAtom);
+useRecoilState(waAtom); // $ExpectType [string, SetterOrUpdater<string>]
 
 useRecoilState<number>(waAtom); // $ExpectError
 useRecoilState<number | string>(waAtom); // $ExpectError
 useRecoilValue<number>(waAtom); // $ExpectError
-useRecoilValue<number | string>(waAtom);
+useRecoilValue<number | string>(waAtom); // $ExpectType string | number
 useRecoilValue<number>(nsAtom); // $ExpectError
 
-useRecoilValue(myAtom);
-useRecoilValue(mySelector1);
-useRecoilValue(readOnlySelectorSel);
-useRecoilValue(writeableSelector);
+useRecoilValue(myAtom); // $ExpectType number
+useRecoilValue(mySelector1); // $ExpectType number
+useRecoilValue(readOnlySelectorSel); // $ExpectType number
+useRecoilValue(writeableSelector); // $ExpectType number
 useRecoilValue({}); // $ExpectError
 
-useRecoilValueLoadable(myAtom);
-useRecoilValueLoadable(readOnlySelectorSel);
-useRecoilValueLoadable(writeableSelector);
+useRecoilValueLoadable(myAtom); // $ExpectType Loadable<number>
+useRecoilValueLoadable(readOnlySelectorSel); // $ExpectType Loadable<number>
+useRecoilValueLoadable(writeableSelector); // $ExpectType Loadable<number>
 useRecoilValueLoadable({}); // $ExpectError
 
-useRecoilState(myAtom);
-useRecoilState(writeableSelector);
+useRecoilState(myAtom); // $ExpectType [number, SetterOrUpdater<number>]
+useRecoilState(writeableSelector); // $ExpectType [number, SetterOrUpdater<number>]
 useRecoilState(readOnlySelectorSel); // $ExpectError
 useRecoilState({}); // $ExpectError
 
@@ -137,15 +126,19 @@ useRecoilStateLoadable(writeableSelector);
 useRecoilStateLoadable(readOnlySelectorSel); // $ExpectError
 useRecoilStateLoadable({}); // $ExpectError
 
-useSetRecoilState(myAtom);
-useSetRecoilState(writeableSelector);
+useSetRecoilState(myAtom); // $ExpectType SetterOrUpdater<number>
+useSetRecoilState(writeableSelector); // $ExpectType SetterOrUpdater<number>
 useSetRecoilState(readOnlySelectorSel); // $ExpectError
 useSetRecoilState({}); // $ExpectError
 
-useResetRecoilState(myAtom);
-useResetRecoilState(writeableSelector);
+useResetRecoilState(myAtom); // $ExpectType Resetter
+useResetRecoilState(writeableSelector); // $ExpectType Resetter
 useResetRecoilState(readOnlySelectorSel); // $ExpectError
 useResetRecoilState({}); // $ExpectError
+
+useGetRecoilValueInfo_UNSTABLE(myAtom); // $ExpectType AtomInfo<number>
+useGetRecoilValueInfo_UNSTABLE(mySelector2); // $ExpectType AtomInfo<string>
+useGetRecoilValueInfo_UNSTABLE({}); // $ExpectError
 
 useRecoilCallback(({ snapshot, set, reset, gotoSnapshot }) => async () => {
   snapshot; // $ExpectType Snapshot
@@ -158,8 +151,8 @@ useRecoilCallback(({ snapshot, set, reset, gotoSnapshot }) => async () => {
   gotoSnapshot(3); // $ExpectError
   gotoSnapshot(myAtom); // $ExpectError
 
-  loadable.contents; // $ExpectType number | Error | LoadablePromise<number>
-  loadable.state; // $ExpectType "hasError" | "hasValue" | "loading"
+  loadable.contents; // $ExpectType number | LoadablePromise<number> | Error
+  loadable.state; // $ExpectType "hasValue" | "loading" | "hasError"
 
   set(myAtom, 5);
   set(myAtom, 'hello'); // $ExpectError
@@ -172,11 +165,18 @@ useRecoilCallback(({ snapshot, set, reset, gotoSnapshot }) => async () => {
 {
   useRecoilTransactionObserver_UNSTABLE(
     ({snapshot, previousSnapshot}) => {
-      snapshot.getLoadable(myAtom);
-      snapshot.getPromise(mySelector1);
+      snapshot.getLoadable(myAtom); // $ExpectType Loadable<number>
+      snapshot.getPromise(mySelector1); // $ExpectType Promise<number>
+      snapshot.getPromise(mySelector2); // $ExpectType Promise<string>
 
-      previousSnapshot.getLoadable(myAtom);
-      previousSnapshot.getPromise(mySelector2);
+      previousSnapshot.getLoadable(myAtom); // $ExpectType Loadable<number>
+      previousSnapshot.getPromise(mySelector1); // $ExpectType Promise<number>
+      previousSnapshot.getPromise(mySelector2); // $ExpectType Promise<string>
+
+      for (const node of Array.from(snapshot.getNodes_UNSTABLE({isModified: true}))) {
+        const loadable = snapshot.getLoadable(node); // $ExpectType Loadable<unknown>
+        loadable.state; // $ExpectType "hasValue" | "loading" | "hasError"
+      }
     },
   );
 }
@@ -372,6 +372,92 @@ isRecoilValue(mySelector1);
 
   useRecoilValue(mySel2).a; // $ExpectType number
   useRecoilValue(mySel2).b; // $ExpectType string
+}
+
+/**
+ * waitForAllSettled() tests
+ */
+{
+  const numSel: RecoilValueReadOnly<number> = {} as any;
+  const strSel: RecoilValueReadOnly<string> = {} as any;
+
+  const mySel = waitForAllSettled([numSel, strSel]);
+  const mySel2 = waitForAllSettled({ a: numSel, b: strSel });
+
+  useRecoilValue(mySel)[0]; // $ExpectType Loadable<number>
+  useRecoilValue(mySel)[1]; // $ExpectType Loadable<string>
+
+  useRecoilValue(mySel2).a; // $ExpectType Loadable<number>
+  useRecoilValue(mySel2).b; // $ExpectType Loadable<string>
+}
+
+/**
+ * effects_UNSTABLE on atom()
+ */
+{
+  atom({
+    key: 'thisismyrandomkey',
+    default: 0,
+    effects_UNSTABLE: [
+      ({setSelf, onSet, resetSelf}) => {
+        setSelf(1);
+        setSelf('a'); // $ExpectError
+
+        onSet(val => {
+          val; // $ExpectType number | DefaultValue
+        });
+        onSet('a'); // $ExpectError
+
+        resetSelf();
+        resetSelf('a'); // $ExpectError
+      },
+    ],
+  });
+}
+
+/**
+ * effects_UNSTABLE on atomFamily()
+ */
+{
+  atomFamily({
+    key: 'myrandomatomfamilykey',
+    default: (param: number) => param,
+    effects_UNSTABLE: (param) => [
+      ({setSelf, onSet, resetSelf}) => {
+        param; // $ExpectType number
+
+        setSelf(1);
+        setSelf('a'); // $ExpectError
+
+        onSet(val => {
+          val; // $ExpectType number | DefaultValue
+        });
+        onSet('a'); // $ExpectError
+
+        resetSelf();
+        resetSelf('a'); // $ExpectError
+      },
+    ],
+  });
+}
+
+/**
+ * snapshot_UNSTABLE()
+ */
+{
+  snapshot_UNSTABLE(
+    mutableSnapshot => mutableSnapshot.set(myAtom, 1)
+  )
+  .getLoadable(mySelector1)
+  .valueOrThrow();
+}
+
+{
+  snapshot_UNSTABLE(
+    mutableSnapshot => mutableSnapshot.set(myAtom, '1') // $ExpectError
+  )
+  .getLoadable(mySelector1)
+  .valueOrThrow();
 }
 
 /* eslint-enable @typescript-eslint/no-explicit-any */

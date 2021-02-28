@@ -5,17 +5,17 @@
  * LICENSE file in the root directory of this source tree.
  *
  * @emails oncall+recoil
- * @flow strict-local
+ * @flow strict
  * @format
  */
 
 'use strict';
 
 /**
- * The everySet() method tests whether all elements in the given Set pass the
+ * The someSet() method tests whether some elements in the given Set pass the
  * test implemented by the provided function.
  */
-function everySet<T>(
+function someSet<T>(
   set: $ReadOnlySet<T>,
   callback: (value: T, key: T, set: $ReadOnlySet<T>) => boolean,
   context?: mixed,
@@ -24,12 +24,12 @@ function everySet<T>(
   let current = iterator.next();
   while (!current.done) {
     const entry = current.value;
-    if (!callback.call(context, entry[1], entry[0], set)) {
-      return false;
+    if (callback.call(context, entry[1], entry[0], set)) {
+      return true;
     }
     current = iterator.next();
   }
-  return true;
+  return false;
 }
 
-module.exports = everySet;
+module.exports = someSet;

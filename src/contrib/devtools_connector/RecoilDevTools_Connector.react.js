@@ -11,20 +11,22 @@
 
 'use strict';
 
-const React = require('React');
-
-const {useEffect, useRef} = require('react');
-const {Snapshot} = require('recoil-oss/core/Recoil_Snapshot');
+const {Snapshot} = require('../../core/Recoil_Snapshot');
 const {
   useGotoRecoilSnapshot,
   useRecoilSnapshot,
-} = require('recoil-oss/hooks/Recoil_Hooks');
-const useEffectOnce = require('useEffectOnce');
+} = require('../../hooks/Recoil_Hooks');
+const React = require('react');
+const {useEffect, useRef} = require('react');
+
 type Props = $ReadOnly<{
   name?: string,
-  persitenceLimit?: number,
+  persistenceLimit?: number,
   initialSnapshot?: ?Snapshot,
   devMode?: ?boolean,
+  maxDepth?: number,
+  maxItems?: number,
+  serializeFn?: (mixed, string) => mixed,
 }>;
 
 type ConnectProps = $ReadOnly<{
@@ -42,11 +44,7 @@ function connect(
     return null;
   }
 
-  const devTools =
-    window.__RECOIL_DEVTOOLS_EXTENSION__ &&
-    window.__RECOIL_DEVTOOLS_EXTENSION__.connect &&
-    window.__RECOIL_DEVTOOLS_EXTENSION__.connect(props);
-  return devTools ?? null;
+  return window.__RECOIL_DEVTOOLS_EXTENSION__?.connect?.(props);
 }
 
 let CONNECTION_INDEX = 0;
@@ -57,7 +55,10 @@ let CONNECTION_INDEX = 0;
  */
 function Connector({
   name = `Recoil Connection ${CONNECTION_INDEX++}`,
-  persitenceLimit = 50,
+  persistenceLimit = 50,
+  maxDepth,
+  maxItems,
+  serializeFn,
   devMode = true,
 }: Props): React.Node {
   const transactionIdRef = useRef(0);
@@ -65,25 +66,24 @@ function Connector({
   const goToSnapshot = useGotoRecoilSnapshot();
   const snapshot = useRecoilSnapshot();
 
-  useEffectOnce(() => {
+  useEffect(() => {
     connectionRef.current = connect({
       name,
-      persitenceLimit,
+      persistenceLimit,
       devMode,
       goToSnapshot,
+      maxDepth,
+      maxItems,
+      serializeFn,
       initialSnapshot: snapshot,
     });
 
-    if (connectionRef.current?.disconnect != null) {
-      return connectionRef.current?.disconnect;
-    }
-  });
+    return connectionRef.current?.disconnect;
+  }, []);
 
   useEffect(() => {
     const transactionID = transactionIdRef.current++;
-    if (connectionRef.current?.track != null) {
-      connectionRef.current.track(transactionID, snapshot);
-    }
+    connectionRef.current?.track?.(transactionID, snapshot);
   }, [snapshot]);
 
   return null;

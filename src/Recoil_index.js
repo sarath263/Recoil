@@ -42,6 +42,8 @@ const {batchUpdates, setBatcher} = require('./core/Recoil_Batching');
 const {DefaultValue} = require('./core/Recoil_Node');
 const {RecoilRoot} = require('./core/Recoil_RecoilRoot.react');
 const {isRecoilValue} = require('./core/Recoil_RecoilValue');
+const {retentionZone} = require('./core/Recoil_RetentionZone');
+const {freshSnapshot} = require('./core/Recoil_Snapshot');
 const {
   useGotoRecoilSnapshot,
   useRecoilCallback,
@@ -52,10 +54,12 @@ const {
   useRecoilValue,
   useRecoilValueLoadable,
   useResetRecoilState,
+  useRetain,
   useSetRecoilState,
   useSetUnvalidatedAtomValues,
   useTransactionObservation_DEPRECATED,
 } = require('./hooks/Recoil_Hooks');
+const useGetRecoilValueInfo = require('./hooks/Recoil_useGetRecoilValueInfo');
 const useRecoilBridgeAcrossReactRoots = require('./hooks/Recoil_useRecoilBridgeAcrossReactRoots');
 const atom = require('./recoil_values/Recoil_atom');
 const atomFamily = require('./recoil_values/Recoil_atomFamily');
@@ -67,6 +71,7 @@ const selectorFamily = require('./recoil_values/Recoil_selectorFamily');
 const {
   noWait,
   waitForAll,
+  waitForAllSettled,
   waitForAny,
   waitForNone,
 } = require('./recoil_values/Recoil_WaitFor');
@@ -83,6 +88,9 @@ module.exports = {
   atom,
   selector,
 
+  // Other factories
+  retentionZone,
+
   // Convenience RecoilValues
   atomFamily,
   selectorFamily,
@@ -97,6 +105,8 @@ module.exports = {
   useRecoilStateLoadable,
   useSetRecoilState,
   useResetRecoilState,
+  useGetRecoilValueInfo_UNSTABLE: useGetRecoilValueInfo,
+  useRetain,
 
   // Hooks for asynchronous Recoil
   useRecoilCallback,
@@ -113,6 +123,7 @@ module.exports = {
   waitForNone,
   waitForAny,
   waitForAll,
+  waitForAllSettled,
 
   // Other functions
   isRecoilValue,
@@ -120,4 +131,7 @@ module.exports = {
   // Batching
   batchUpdates,
   setBatcher,
+
+  // Snapshot Utils
+  snapshot_UNSTABLE: freshSnapshot,
 };

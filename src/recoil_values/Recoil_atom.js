@@ -64,9 +64,14 @@ import type {
   ResolvedLoadablePromiseInfo,
 } from '../adt/Recoil_Loadable';
 import type {DependencyMap} from '../core/Recoil_Graph';
-import type {PersistenceInfo, ReadWriteNodeOptions} from '../core/Recoil_Node';
+import type {
+  PersistenceInfo,
+  ReadWriteNodeOptions,
+  Trigger,
+} from '../core/Recoil_Node';
 import type {RecoilState, RecoilValue} from '../core/Recoil_RecoilValue';
-import type {AtomValues, NodeKey, Store, TreeState} from '../core/Recoil_State';
+import type {RetainedBy} from '../core/Recoil_RetainedBy';
+import type {AtomWrites, NodeKey, Store, TreeState} from '../core/Recoil_State';
 
 // @fb-only: const {scopedAtom} = require('Recoil_ScopedAtom');
 
@@ -78,7 +83,9 @@ const {
 const {
   DEFAULT_VALUE,
   DefaultValue,
+  getConfigDeletionHandler,
   registerNode,
+  setConfigDeletionHandler,
 } = require('../core/Recoil_Node');
 const {isRecoilValue} = require('../core/Recoil_RecoilValue');
 const {
@@ -86,6 +93,7 @@ const {
   setRecoilValue,
   setRecoilValueLoadable,
 } = require('../core/Recoil_RecoilValueInterface');
+const {retainedByOptionWithDefault} = require('../core/Recoil_Retention');
 const deepFreezeValue = require('../util/Recoil_deepFreezeValue');
 const expectationViolation = require('../util/Recoil_expectationViolation');
 const isPromise = require('../util/Recoil_isPromise');
@@ -108,7 +116,7 @@ type NewValueOrUpdater<T> =
 // Effect is called the first time a node is used with a <RecoilRoot>
 export type AtomEffect<T> = ({
   node: RecoilState<T>,
-  trigger: 'set' | 'get',
+  trigger: Trigger,
 
   // Call synchronously to initialize value or async to change it later
   setSelf: (
@@ -133,6 +141,7 @@ export type AtomOptions<T> = $ReadOnly<{
   persistence_UNSTABLE?: PersistenceSettings<T>,
   // @fb-only: scopeRules_APPEND_ONLY_READ_THE_DOCS?: ScopeRules,
   dangerouslyAllowMutability?: boolean,
+  retainedBy_UNSTABLE?: RetainedBy,
 }>;
 
 type BaseAtomOptions<T> = $ReadOnly<{
@@ -142,6 +151,9 @@ type BaseAtomOptions<T> = $ReadOnly<{
 
 function baseAtom<T>(options: BaseAtomOptions<T>): RecoilState<T> {
   const {key, persistence_UNSTABLE: persistence} = options;
+  const retainedBy = retainedByOptionWithDefault(options.retainedBy_UNSTABLE);
+
+  let liveStoresCount = 0;
 
   let defaultLoadable: Loadable<T> = isPromise(options.default)
     ? loadableWithPromise(
@@ -203,32 +215,40 @@ function baseAtom<T>(options: BaseAtomOptions<T>): RecoilState<T> {
   function initAtom(
     store: Store,
     initState: TreeState,
-    trigger: 'set' | 'get',
-  ) {
-    if (store.getState().knownAtoms.has(key)) {
-      return;
-    }
+    trigger: Trigger,
+  ): () => void {
+    liveStoresCount++;
+    const alreadyKnown = store.getState().knownAtoms.has(key);
     store.getState().knownAtoms.add(key);
 
     // Setup async defaults to notify subscribers when they resolve
     if (defaultLoadable.state === 'loading') {
-      function notifyDefaultSubscribers() {
+      const notifyDefaultSubscribers = () => {
         const state = store.getState().nextTree ?? store.getState().currentTree;
         if (!state.atomValues.has(key)) {
           markRecoilValueModified(store, node);
         }
-      }
+      };
       defaultLoadable.contents
         .then(notifyDefaultSubscribers)
         .catch(notifyDefaultSubscribers);
     }
 
     // Run Atom Effects
+
+    // This state is scoped by Store, since this is in the initAtom() closure
     let initValue: NewValue<T> = DEFAULT_VALUE;
-    if (options.effects_UNSTABLE != null) {
+    let pendingSetSelf: ?{
+      effect: AtomEffect<T>,
+      value: T | DefaultValue,
+    } = null;
+
+    if (options.effects_UNSTABLE != null && !alreadyKnown) {
       let duringInit = true;
 
-      function setSelf(valueOrUpdater: NewValueOrUpdater<T>) {
+      const setSelf = (effect: AtomEffect<T>) => (
+        valueOrUpdater: NewValueOrUpdater<T>,
+      ) => {
         if (duringInit) {
           const currentValue: T | DefaultValue =
             initValue instanceof DefaultValue || isPromise(initValue)
@@ -238,9 +258,8 @@ function baseAtom<T>(options: BaseAtomOptions<T>): RecoilState<T> {
               : initValue;
           initValue =
             typeof valueOrUpdater === 'function'
-              ? // cast to any because we can't restrict type from being a function itself without losing support for opaque types
-                // flowlint-next-line unclear-type:off
-                (valueOrUpdater: any)(currentValue)
+              ? // cast to any because we can't restrict T from being a function without losing support for opaque types
+                (valueOrUpdater: any)(currentValue) // flowlint-line unclear-type:off
               : valueOrUpdater;
         } else {
           if (isPromise(valueOrUpdater)) {
@@ -248,12 +267,31 @@ function baseAtom<T>(options: BaseAtomOptions<T>): RecoilState<T> {
               'Setting atoms to async values is not implemented.',
             );
           }
-          setRecoilValue(store, node, valueOrUpdater);
-        }
-      }
-      const resetSelf = () => setSelf(DEFAULT_VALUE);
 
-      function onSet(handler: (T | DefaultValue, T | DefaultValue) => void) {
+          if (typeof valueOrUpdater !== 'function') {
+            pendingSetSelf = {effect, value: valueOrUpdater};
+          }
+
+          setRecoilValue(
+            store,
+            node,
+            typeof valueOrUpdater === 'function'
+              ? currentValue => {
+                  const newValue =
+                    // cast to any because we can't restrict T from being a function without losing support for opaque types
+                    (valueOrUpdater: any)(currentValue); // flowlint-line unclear-type:off
+                  pendingSetSelf = {effect, value: newValue};
+                  return newValue;
+                }
+              : valueOrUpdater,
+          );
+        }
+      };
+      const resetSelf = effect => () => setSelf(effect)(DEFAULT_VALUE);
+
+      const onSet = effect => (
+        handler: (T | DefaultValue, T | DefaultValue) => void,
+      ) => {
         store.subscribeToTransactions(currentStore => {
           // eslint-disable-next-line prefer-const
           let {currentTree, previousTree} = currentStore.getState();
@@ -274,13 +312,35 @@ function baseAtom<T>(options: BaseAtomOptions<T>): RecoilState<T> {
               oldLoadable.state === 'hasValue'
                 ? oldLoadable.contents
                 : DEFAULT_VALUE; // TODO This isn't actually valid, use as a placeholder for now.
-            handler(newValue, oldValue);
+
+            // Ignore atom value changes that were set via setSelf() in the same effect.
+            // We will still properly call the handler if there was a subsequent
+            // set from something other than an atom effect which was batched
+            // with the `setSelf()` call.  However, we may incorrectly ignore
+            // the handler if the subsequent batched call happens to set the
+            // atom to the exact same value as the `setSelf()`.   But, in that
+            // case, it was kind of a noop, so the semantics are debatable..
+            if (
+              pendingSetSelf?.effect !== effect ||
+              pendingSetSelf?.value !== newValue
+            ) {
+              handler(newValue, oldValue);
+            }
+          }
+          if (pendingSetSelf?.effect === effect) {
+            pendingSetSelf = null;
           }
         }, key);
-      }
+      };
 
       for (const effect of options.effects_UNSTABLE ?? []) {
-        const cleanup = effect({node, trigger, setSelf, resetSelf, onSet});
+        const cleanup = effect({
+          node,
+          trigger,
+          setSelf: setSelf(effect),
+          resetSelf: resetSelf(effect),
+          onSet: onSet(effect),
+        });
         if (cleanup != null) {
           cleanupEffectsByStore.set(store, cleanup);
         }
@@ -292,16 +352,26 @@ function baseAtom<T>(options: BaseAtomOptions<T>): RecoilState<T> {
     // Mutate initial state in place since we know there are no other subscribers
     // since we are the ones initializing on first use.
     if (!(initValue instanceof DefaultValue)) {
-      initState.atomValues.set(
-        key,
-        isPromise(initValue)
-          ? loadableWithPromise(wrapPendingPromise(store, initValue))
-          : loadableWithValue(initValue),
-      );
+      const initLoadable = isPromise(initValue)
+        ? loadableWithPromise(wrapPendingPromise(store, initValue))
+        : loadableWithValue(initValue);
+      initState.atomValues.set(key, initLoadable);
+
+      // If there is a pending transaction, then also mutate the next state tree.
+      // This could happen if the atom was first initialized in an action that
+      // also updated some other atom's state.
+      store.getState().nextTree?.atomValues.set(key, initLoadable);
     }
+
+    return () => {
+      liveStoresCount--;
+      cleanupEffectsByStore.get(store)?.();
+      cleanupEffectsByStore.delete(store);
+      store.getState().knownAtoms.delete(key); // FIXME remove knownAtoms?
+    };
   }
 
-  function myPeek(_store, state: TreeState): ?Loadable<T> {
+  function peekAtom(_store, state: TreeState): ?Loadable<T> {
     return (
       state.atomValues.get(key) ??
       cachedAnswerForUnvalidatedValue?.[1] ??
@@ -309,9 +379,10 @@ function baseAtom<T>(options: BaseAtomOptions<T>): RecoilState<T> {
     );
   }
 
-  function myGet(store: Store, state: TreeState): [DependencyMap, Loadable<T>] {
-    initAtom(store, state, 'get');
-
+  function getAtom(
+    _store: Store,
+    state: TreeState,
+  ): [DependencyMap, Loadable<T>] {
     if (state.atomValues.has(key)) {
       // Atom value is stored in state:
       return [new Map(), nullthrows(state.atomValues.get(key))];
@@ -344,22 +415,15 @@ function baseAtom<T>(options: BaseAtomOptions<T>): RecoilState<T> {
     }
   }
 
-  function myCleanup(store: Store) {
-    cleanupEffectsByStore.get(store)?.();
-    cleanupEffectsByStore.delete(store);
-  }
-
-  function invalidate() {
+  function invalidateAtom() {
     cachedAnswerForUnvalidatedValue = undefined;
   }
 
-  function mySet(
-    store: Store,
+  function setAtom(
+    _store: Store,
     state: TreeState,
     newValue: T | DefaultValue,
-  ): [DependencyMap, AtomValues] {
-    initAtom(store, state, 'set');
-
+  ): [DependencyMap, AtomWrites] {
     // Bail out if we're being set to the existing value, or if we're being
     // reset but have no stored value (validated or unvalidated) to reset from:
     if (state.atomValues.has(key)) {
@@ -384,14 +448,19 @@ function baseAtom<T>(options: BaseAtomOptions<T>): RecoilState<T> {
     return [new Map(), new Map().set(key, loadableWithValue(newValue))];
   }
 
+  function shouldDeleteConfigOnReleaseAtom() {
+    return getConfigDeletionHandler(key) !== undefined && liveStoresCount <= 0;
+  }
+
   const node = registerNode(
     ({
       key,
-      peek: myPeek,
-      get: myGet,
-      set: mySet,
-      cleanUp: myCleanup,
-      invalidate,
+      peek: peekAtom,
+      get: getAtom,
+      set: setAtom,
+      init: initAtom,
+      invalidate: invalidateAtom,
+      shouldDeleteConfigOnRelease: shouldDeleteConfigOnReleaseAtom,
       dangerouslyAllowMutability: options.dangerouslyAllowMutability,
       persistence_UNSTABLE: options.persistence_UNSTABLE
         ? {
@@ -400,6 +469,7 @@ function baseAtom<T>(options: BaseAtomOptions<T>): RecoilState<T> {
           }
         : undefined,
       shouldRestoreFromSnapshots: true,
+      retainedBy,
     }: ReadWriteNodeOptions<T>),
   );
   return node;
@@ -462,7 +532,7 @@ function atomWithFallback<T>(
     effects_UNSTABLE: (options.effects_UNSTABLE: any),
   });
 
-  return selector<T>({
+  const sel = selector<T>({
     key: `${options.key}__withFallback`,
     get: ({get}) => {
       const baseValue = get(base);
@@ -471,6 +541,8 @@ function atomWithFallback<T>(
     set: ({set}, newValue) => set(base, newValue),
     dangerouslyAllowMutability: options.dangerouslyAllowMutability,
   });
+  setConfigDeletionHandler(sel.key, getConfigDeletionHandler(options.key));
+  return sel;
 }
 
 module.exports = atom;
